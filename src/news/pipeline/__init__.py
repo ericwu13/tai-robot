@@ -241,12 +241,14 @@ class NewsSignalPipeline:
                 continue
             classified_items.append((dec, ev))
 
-        if unreached_cluster_ids:
-            # Drop newly created unclassified clusters so retried articles are not
-            # mis-flagged as duplicates on the next pass after API recovery.
+        # Drop unclassified clusters that never got a vote: an API abort, or a
+        # decode/schema failure. A cluster that already has classified_category
+        # stays, so a later similar article is not stuck as a duplicate.
+        drop_ids = unreached_cluster_ids | {dec.cluster_id for dec, _err in l3_failed_items}
+        if drop_ids:
             self.clusterer.active = [
                 c for c in self.clusterer.active
-                if not (c.cluster_id in unreached_cluster_ids and not c.classified_category)
+                if not (c.cluster_id in drop_ids and not c.classified_category)
             ]
 
         # Layer 4: Signal routing + asymmetric thresholds + market cross-validation

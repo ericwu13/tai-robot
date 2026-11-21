@@ -280,6 +280,7 @@ class BackfillResult:
     final_session_state: dict[str, Any] = field(default_factory=dict)
     final_cluster_state: dict[str, Any] = field(default_factory=dict)
     sample_representatives: list[str] = field(default_factory=list)
+    embedder_used: str = ""
 
 
 def _filter_batches(
@@ -469,6 +470,8 @@ def backfill_batches(
         }
         res.final_cluster_state = pipeline.dump_state()
 
+    emb = pipeline.clusterer.embedder
+    res.embedder_used = "none" if emb is None else str(getattr(emb, "last_used_provider", "") or emb.name or "none")
     return res
 
 
@@ -561,6 +564,11 @@ def write_backfill_outputs(
     }
 
 
+def resolve_embedder_override(explicit: str = "", settings_provider: str = "") -> str:
+    """``--embedder``, else settings. Empty follows the YAML provider for dry-run and live."""
+    return str(explicit or settings_provider or "").strip()
+
+
 def format_summary(res: BackfillResult, *, dry_run: bool) -> str:
     n_in = max(1, res.input_articles)
     saved = max(0, res.input_articles - res.l2_unique)
@@ -570,6 +578,7 @@ def format_summary(res: BackfillResult, *, dry_run: bool) -> str:
         f"Input v1 rows       : {res.input_articles:,}",
         f"Layer 1 kept/dropped: {res.l1_kept:,} / {res.l1_dropped:,} ({res.l1_dropped / n_in * 100:.1f}% dropped)",
         f"Layer 2 unique/dups : {res.l2_unique:,} / {res.l2_duplicates:,} (LLM savings: {saved / n_in * 100:.1f}%)",
+        f"Embedder used       : {res.embedder_used or 'none'}",
     ]
     if dry_run:
         est_min = res.l2_unique * 1.5 / 60.0
@@ -650,7 +659,7 @@ def main() -> int:
         return 0
 
     p_cfg = load_pipeline_config(args.config or cfg.get("filter_config") or None)
-    emb_override = args.embedder or cfg.get("embedding_provider") or ("lexical" if args.dry_run else "")
+    emb_override = resolve_embedder_override(args.embedder, cfg.get("embedding_provider") or "")
     raw_clf = GeminiEventClassifier(
         p_cfg,
         api_key=api_key,
@@ -663,7 +672,7 @@ def main() -> int:
 
     pipe = NewsSignalPipeline(
         p_cfg,
-        api_key="" if args.dry_run and emb_override != "gemini" else api_key,
+        api_key=api_key,
         embedder_provider_override=emb_override,
         classifier=clf,
     )

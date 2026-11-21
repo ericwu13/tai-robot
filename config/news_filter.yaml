@@ -161,7 +161,7 @@ dedup:
 
 classifier:
   model: 'gemini-3.6-flash'
-  max_output_tokens: 1024
+  max_output_tokens: 8192
   timeout_s: 30
   retry_attempts: 3
   retry_base_delay_s: 1.0

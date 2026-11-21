@@ -8,7 +8,7 @@ Stages:
    ``cleaned_title + summary`` via a pluggable :class:`Embedder` (default:
    Gemini ``batchEmbedContents`` REST API with automatic fallback to pure-Python
    signed-hash lexical embeddings), and computes O(k) cosine similarity ONLY
-   against active cluster centroids — never re-running global DBSCAN.
+   against each cluster's frozen anchor (centroid if an old sidecar has none).
 3. Single representative + cross-day drift protection (24-48h archive): only
    the first or highest-authority article triggers Layer 3 LLM classification;
    duplicates increment ``mention_count``. New clusters similar to a 4-48h
@@ -323,6 +323,7 @@ class EventCluster:
     source_tier: int
     mention_count: int = 1
     centroid: list[float] = field(default_factory=list)
+    anchor: list[float] | None = None
     embedder_name: str = ""
     simhashes: list[int] = field(default_factory=list)
     canonical_urls: list[str] = field(default_factory=list)
@@ -342,6 +343,7 @@ class EventCluster:
             "source_tier": int(self.source_tier),
             "mention_count": int(self.mention_count),
             "centroid": _round_vec(self.centroid, 3),
+            "anchor": None if self.anchor is None else _round_vec(self.anchor, 3),
             "embedder_name": self.embedder_name,
             "simhashes": [int(x) for x in self.simhashes[-4 if archived else -_MAX_CLUSTER_SIMHASHES :]],
             "classified_summary": self.classified_summary[:240],
@@ -373,6 +375,7 @@ class EventCluster:
             source_tier=int(raw.get("source_tier", 3)),
             mention_count=max(1, int(raw.get("mention_count", 1))),
             centroid=[float(x) for x in (raw.get("centroid") or [])],
+            anchor=[float(x) for x in raw["anchor"]] if isinstance(raw.get("anchor"), list) else None,
             embedder_name=str(raw.get("embedder_name") or ""),
             simhashes=[int(x) for x in (raw.get("simhashes") or [])],
             canonical_urls=[str(x) for x in (raw.get("canonical_urls") or [])],
@@ -487,7 +490,7 @@ class IncrementalEventClusterer:
         )
 
     def expire_windows(self, now: datetime) -> None:
-        """Move clusters past ``cluster_window_hours`` to archive; drop past ``followup_window_hours``."""
+        """Active window is first_seen_at + cluster_window_hours. Unparsable first_seen expires."""
         now_tpe = _as_tpe(now)
         active_cutoff = now_tpe - timedelta(hours=self._cfg.cluster_window_hours)
         archive_cutoff = now_tpe - timedelta(hours=self._cfg.followup_window_hours)
@@ -495,10 +498,10 @@ class IncrementalEventClusterer:
         still_active: list[EventCluster] = []
         newly_archived: list[EventCluster] = []
         for c in self.active:
-            seen = _parse_iso(c.last_seen_at) or _parse_iso(c.first_seen_at)
-            if seen is None or seen >= active_cutoff:
+            first = _parse_iso(c.first_seen_at)
+            if first is not None and first >= active_cutoff:
                 still_active.append(c)
-            elif seen >= archive_cutoff:
+            elif first is not None and first >= archive_cutoff:
                 newly_archived.append(c)
 
         kept_archived: list[EventCluster] = []
@@ -532,9 +535,10 @@ class IncrementalEventClusterer:
         best_cluster: EventCluster | None = None
         best_sim = 0.0
         for c in pool:
-            if not c.centroid or c.embedder_name != embedder_name:
+            ref = c.centroid if c.anchor is None else c.anchor
+            if not ref or c.embedder_name != embedder_name:
                 continue
-            sim = cosine_similarity(vec, c.centroid)
+            sim = cosine_similarity(vec, ref)
             if sim > best_sim:
                 best_sim = sim
                 best_cluster = c
@@ -700,7 +704,6 @@ class IncrementalEventClusterer:
                 )
                 continue
 
-            # Stage 2: O(k) incremental cosine similarity against active centroids
             sem_hit, sim = self._match_semantic(vec, embedder_name, self.active, active_thresh)
             if sem_hit is not None:
                 upgraded = self._merge_into_cluster(
@@ -736,7 +739,8 @@ class IncrementalEventClusterer:
                 representative_url=pf.canonical_url,
                 source_tier=pf.source_tier,
                 mention_count=1,
-                centroid=vec,
+                centroid=list(vec),
+                anchor=list(vec),
                 embedder_name=embedder_name if vec else "",
                 simhashes=[sh] if sh else [],
                 canonical_urls=[pf.canonical_url] if pf.canonical_url else [],

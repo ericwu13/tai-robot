@@ -79,7 +79,7 @@ class DedupConfig:
 @dataclass(frozen=True)
 class ClassifierConfig:
     model: str = "gemini-3.6-flash"
-    max_output_tokens: int = 1024
+    max_output_tokens: int = 8192
     timeout_s: int = 30
     retry_attempts: int = 3
     retry_base_delay_s: float = 1.0
@@ -192,7 +192,7 @@ def _build_config(raw: dict[str, Any], source_path: str) -> PipelineConfig:
         ),
         classifier=ClassifierConfig(
             model=str(cl.get("model", "gemini-3.6-flash")).strip(),
-            max_output_tokens=int(cl.get("max_output_tokens", 1024)),
+            max_output_tokens=int(cl.get("max_output_tokens", 8192)),
             timeout_s=int(cl.get("timeout_s", 30)),
             retry_attempts=max(1, int(cl.get("retry_attempts", 3))),
             retry_base_delay_s=float(cl.get("retry_base_delay_s", 1.0)),
