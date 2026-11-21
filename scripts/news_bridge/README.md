@@ -7,7 +7,7 @@ instance) but runs fine from a plain shell too.  Full framework design:
 
 | # | Script | Cadence | Output |
 |---|--------|---------|--------|
-| W1 | `calendar_bridge.py` | daily | economic-calendar risk windows |
+| W1 | `calendar_bridge.py` | daily 10:00 TPE | `events.json` (auto-fetches official Fed FOMC, US BLS CPI/NFP/PPI, US BEA PCE/GDP, Nasdaq Tier-1 AI/semi earnings, TAIFEX monthly settlement via `config/calendar_sources.yaml`, merged with `calendar_source.json` manual overrides) + `calendar_state.json` fetch-health sidecar. Never refreshes `updated_at` when all remote sources fail |
 | W2 | `crossmarket_monitor.py` | every 2 min (08:00–05:00 TPE) | `signal.json` circuit breaker + `regime_vote_w2.json` |
 | W3 | `rss_scorer.py` | every 30 min | `regime_vote_w3.json` (RSS + Gemini sentiment); every scored article appended to `news/news_log_YYYYMM.jsonl` (one file per month, never trimmed; a pre-split `news_log.jsonl` is still read) beside the state file (`--news-log` / `news.rss_news_log` override) — shown in the dashboard's 新聞訊號 view. Discord: `news.rss_discord` (default `errors`: only when Gemini scoring starts failing / recovers; `all` = legacy per-run embed). Failures persist as `error_streak`/`last_error` in the state file, which the dashboard, GUI regime tab and `check_bridge` read |
 | W4 | `chips_monitor.py` | daily 16:15 TPE | `regime_vote_w4.json` (institutional money flow) |

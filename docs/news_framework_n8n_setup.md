@@ -90,27 +90,23 @@ Bot-owned. n8n must never write or delete it. Defaults into the bot directory wh
 
 ---
 
-## 2. Workflow W1 — Calendar sweep
+## 2. Workflow W1 — Calendar sweep (`scripts/news_bridge/calendar_bridge.py`)
 
-**Trigger:** Schedule, daily 10:00 TPE (daily so `updated_at` never goes stale even
-without changes; the event list itself moves weekly).
+**Trigger:** Daily 10:00 TPE (Windows Task Scheduler `Bridge-W1-calendar`:
+`calendar_bridge.py --out <bridge-dir>/events.json`).
 
-**Nodes:**
-1. **HTTP Request** — economic calendar source. Options: Finnhub `/calendar/economic`
-   (free key), or an RSS/page of your choice. For earnings dates: Finnhub
-   `/calendar/earnings?symbol=MSFT` etc., or maintain the mega-cap list by hand quarterly
-   (they're only ~8 dates/quarter).
-2. **Gemini (gemini-2.5-flash)** — only if a source needs extraction from prose. Prompt it
-   to emit strictly the `events` array schema; set the node to JSON output.
-3. **Code node** — build the full document: filter to the next 21 days, map each event to
-   Taipei session-open dates (a US after-close event = Taiwan `NIGHT` of the same Taipei
-   date; a US day-session event ≈ Taiwan `NIGHT` too since it lands 21:30–05:00 TPE),
-   stamp `updated_at` with the current time **with offset**, `version: 1`.
-4. **Write File** — atomic-ish: write `events.json.tmp` then rename/overwrite
-   `events.json` (n8n "Read/Write Files from Disk" node; the bot tolerates a rare torn
-   read — it just fails open until the next 5-min re-parse).
-
-**Discord (optional):** post the coming week's gated sessions every Monday.
+**How it works (zero API keys, pure stdlib, configured via `config/calendar_sources.yaml`):**
+1. **Official public sources (`src/news/calendar_fetchers.py`)**:
+   - **Federal Reserve** (`fomccalendars.htm`) → FOMC rate decisions & SEP/dot-plot (`high`, `us_date ["NIGHT"]`).
+   - **US BLS** (`bls.ics` + `cpi.htm`/`empsit.htm` lookahead) → US CPI & NFP (`high`), PPI (`medium`), strict exact `SUMMARY` match (`us_date ["NIGHT"]`).
+   - **US BEA** (`release_dates.json`) → US PCE & GDP (`medium`, `us_date ["NIGHT"]`).
+   - **Nasdaq Earnings API** (`/api/analyst/{SYM}/earnings-date`) → Tier-1 AI/semi (`TSM`, `NVDA`, `MSFT`, `AVGO` = `high`) & hyperscaler/semi (`GOOGL`, `AMZN`, `META`, `MU`, `ORCL`, `ASML`, `AMD` = `medium`). BMO releases map to `us_date ["NIGHT"]`; US after-close (AMC) releases map to `next_tw_trading_day(us_date + 1) ["DAY"]` (since 16:15 EST = 05:15 TPE after NIGHT closes).
+   - **TAIFEX monthly settlement** (`holidays.settlement_day`) → `low`, `["DAY"]` (display only).
+   - **Manual overrides** (`scripts/news_bridge/calendar_source.json`, e.g. Taiwan CBC quarterly decisions) merge last with highest precedence.
+2. **Resilient publishing & sidecar health (`calendar_state.json`)**:
+   - Partial source failure retains the failed source's cached events and marks `fetch_status: "degraded"`.
+   - Total remote failure exits `1` **without** refreshing `events.json` `updated_at`, so `runs/W1.jsonl`, `check_bridge.py`, and the Dashboard flag it immediately.
+   - `RegimeSwitchingRunner` evaluates `upcoming_event()` only during closed gaps (`current_session(now) is None`) so a `NIGHT`-only event never suppresses the preceding `DAY` session.
 
 ---
 

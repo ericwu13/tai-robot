@@ -136,12 +136,13 @@ def _files(paths: dict) -> dict:
             "W4": os.path.dirname(vote) if vote else "",
             "W5": os.path.dirname(signal) if signal else ""}
     return {"dirs": dirs, "events": events, "events_guess": events_guess,
+            "w1_state": _beside(events, "calendar_state.json"),
             "w2_state": _beside(signal, W2_STATE_NAME), "w3_state": rss,
             "w2_quotes": _beside(signal, QUOTES_NAME),
             "w4_state": _beside(vote, CHIPS_STATE_NAME)}
 
 
-def _stamp(workflow: str, files: dict, read_json) -> dict:
+def _stamp(workflow: str, files: dict, read_json, now: datetime) -> dict:
     """Liveness and fetch health from the bridge's own files:
     ``{last, result, error, failing, warning}``."""
     out = {"last": None, "result": "", "error": "", "failing": False,
@@ -152,7 +153,18 @@ def _stamp(workflow: str, files: dict, read_json) -> dict:
             out["found"] = True
             out["last"] = _ts(data.get("updated_at"))
             events = data.get("events")
-            out["result"] = (f"{len(events)} 筆事件" if isinstance(events, list) else "")
+            if isinstance(events, list):
+                today_iso = now.astimezone(_TZ_TPE).date().isoformat()
+                dated = [e for e in events if isinstance(e, dict) and e.get("date")]
+                upcoming = [e for e in dated if str(e["date"]) >= today_iso]
+                if dated:
+                    out["result"] = f"{len(upcoming)} 筆即將事件"
+                    if not upcoming:
+                        out["warning"] = f"日曆 {len(dated)} 筆事件皆已過期（0 筆未來事件）"
+                else:
+                    out["result"] = f"{len(events)} 筆事件"
+        if files.get("w1_state"):
+            _w1_fetch_health(out, read_json(files["w1_state"]))
     elif workflow in ("W2", "W4"):
         path = files["w2_state" if workflow == "W2" else "w4_state"]
         data = read_json(path) if path else None
@@ -188,6 +200,22 @@ def _stamp(workflow: str, files: dict, read_json) -> dict:
 def _fail(out: dict, message: str) -> None:
     out["failing"] = True
     out["error"] = f"{out['error']}；{message}" if out["error"] else message
+
+
+def _w1_fetch_health(out: dict, state) -> None:
+    if not isinstance(state, dict):
+        return
+    status = _str(state.get("fetch_status"), 20)
+    streak = state.get("error_streak")
+    streak = streak if isinstance(streak, int) and not isinstance(streak, bool) else 0
+    failed = [s for s in (state.get("sources_failed") or []) if isinstance(s, str)]
+    if status == "failed" or streak > 0:
+        err = _str(state.get("last_error"), 200) or "、".join(failed)
+        _fail(out, f"行事曆來源抓取失敗（連續 {max(1, streak)} 次）：{err}")
+    elif status == "degraded" and failed:
+        names = "、".join(failed[:4])
+        msg = f"部分行事曆來源失敗（沿用快取）：{names}"
+        out["warning"] = f"{out['warning']}；{msg}" if out["warning"] else msg
 
 
 def _w3_fetch_health(out: dict, state: dict) -> None:
@@ -240,7 +268,7 @@ def _runs(workflow: str, files: dict, read_runs) -> list[dict]:
 def _row(workflow: str, name: str, schedule: str, desc: str, now: datetime,
          files: dict, read_json, read_runs, redact) -> dict:
     runs = _runs(workflow, files, read_runs)
-    stamp = _stamp(workflow, files, read_json)
+    stamp = _stamp(workflow, files, read_json, now)
     last_run = runs[-1] if runs else None
     run_at = _ts(last_run.get("finished_at")) if last_run else None
     last = max((t for t in (run_at, stamp["last"]) if t), default=None)

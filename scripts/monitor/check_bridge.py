@@ -201,13 +201,51 @@ def _check_events(now, paths, lines, findings):
             path))
         return
     age_days = (to_tpe(now) - to_tpe(updated)).total_seconds() / 86400.0
-    count = len(data.get("events") or [])
-    lines.append(f"events: {count} entries, updated {raw} ({age_days:.1f} days ago)")
+    raw_events = data.get("events") or []
+    count = len(raw_events)
+    today_iso = to_tpe(now).date().isoformat()
+    dated = [e for e in raw_events if isinstance(e, dict) and e.get("date")]
+    upcoming = [e for e in dated if str(e["date"]) >= today_iso]
+    upcoming_high = [e for e in upcoming if str(e.get("severity") or "").lower() == "high"]
+    lines.append(
+        f"events: {count} entries ({len(upcoming)} upcoming, {len(upcoming_high)} high), "
+        f"updated {raw} ({age_days:.1f} days ago)"
+    )
     if age_days > EVENTS_STALE_DAYS:
         findings.append(Finding(
             "P2", "bridge",
             f"event calendar stale ({age_days:.0f} days) — bot will fail open "
             f"on macro events", path))
+    elif dated and not upcoming:
+        findings.append(Finding(
+            "P2", "bridge",
+            f"event calendar has {count} entries but 0 upcoming (all expired) "
+            f"— bot will fail open on macro events", path))
+
+    cal_state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "calendar_state.json")
+    cal_state = read_json(cal_state_path)
+    if isinstance(cal_state, dict):
+        status = str(cal_state.get("fetch_status") or "")
+        streak = cal_state.get("error_streak")
+        streak = streak if isinstance(streak, int) and not isinstance(streak, bool) else 0
+        failed = [str(s) for s in (cal_state.get("sources_failed") or []) if s]
+        err_text = str(cal_state.get("last_error") or "")
+        if status == "failed" or streak >= 2:
+            findings.append(Finding(
+                "P2", "bridge",
+                f"W1 calendar fetch failing (streak {max(1, streak)}): "
+                f"{err_text or ', '.join(failed) or 'all sources failed'}",
+                cal_state_path))
+        elif status == "degraded" and failed:
+            findings.append(Finding(
+                "P3", "bridge",
+                f"W1 calendar degraded ({', '.join(failed)} failed; using cache)",
+                cal_state_path))
+        if not upcoming and not dated and status != "failed":
+            findings.append(Finding(
+                "P2", "bridge",
+                "event calendar has 0 upcoming events — check W1 calendar sources",
+                path))
 
 
 def _check_monitor_log(now, bridge_dir, lines, findings):
