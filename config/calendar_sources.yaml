@@ -1,0 +1,89 @@
+# Centralized configuration for W1 economic & earnings calendar (events.json).
+#
+# All upstream sources below are official, zero-API-key, pure-stdlib endpoints
+# (Federal Reserve FOMC, US BLS CPI/NFP/PPI, US BEA PCE/GDP, Nasdaq earnings)
+# merged with local manual overrides in scripts/news_bridge/calendar_source.json.
+#
+# Severity rules (default bot setting: news.calendar_min_severity: "high"):
+#   high   -> RegimeSwitchingRunner sits out the mapped TAIFEX session (no new entries)
+#   medium -> informational only (displayed in Dashboard 市場脈動, does not stop trading)
+#   low    -> informational only (e.g. TXF monthly settlement, handled by holidays.py)
+
+version: 1
+
+window:
+  lookahead_days: 45
+  lookback_days: 2
+
+http:
+  timeout_s: 15
+
+sources:
+  fomc:
+    enabled: true
+    severity: high
+  bls:
+    enabled: true
+    cpi_severity: high
+    nfp_severity: high
+    ppi_severity: medium
+  bea:
+    enabled: true
+    pce_severity: medium
+    gdp_severity: medium
+  nasdaq_earnings:
+    enabled: true
+    include_estimated: true
+    # When false (default), US after-market-close (AMC) earnings map strictly to
+    # next_tw_trading_day ["DAY"] (since 16:15 EST = 05:15 TPE after NIGHT closes,
+    # and the primary Taiwan cash reaction occurs at 08:45 TPE). Set true to also
+    # include us_date ["NIGHT"] during US daylight saving (EDT, 04:15 TPE).
+    amc_include_edt_night: false
+    tickers:
+      TSM:
+        label: TSMC
+        severity: high
+        default_timing: bmo
+      NVDA:
+        label: NVDA
+        severity: high
+        default_timing: amc
+      MSFT:
+        label: MSFT
+        severity: high
+        default_timing: amc
+      AVGO:
+        label: AVGO
+        severity: high
+        default_timing: amc
+      GOOGL:
+        label: GOOGL
+        severity: medium
+        default_timing: amc
+      AMZN:
+        label: AMZN
+        severity: medium
+        default_timing: amc
+      META:
+        label: META
+        severity: medium
+        default_timing: amc
+      MU:
+        label: MU
+        severity: medium
+        default_timing: amc
+      ORCL:
+        label: ORCL
+        severity: medium
+        default_timing: amc
+      ASML:
+        label: ASML
+        severity: medium
+        default_timing: bmo
+      AMD:
+        label: AMD
+        severity: medium
+        default_timing: amc
+  txf_settlement:
+    enabled: true
+    severity: low

@@ -1408,6 +1408,39 @@ def test_bridge_stale_event_calendar_is_p2(tmp_path, bridge):
     assert any("event calendar stale" in m for m in messages(findings, "P2"))
 
 
+def test_bridge_expired_events_only_is_p2(tmp_path, bridge):
+    """Fresh updated_at with only past-dated entries (Steven W1 silent failure) is P2."""
+    write_json(bridge / "events.json",
+               {"version": 1, "updated_at": iso(NOW - timedelta(hours=2)),
+                "events": [{"date": "2026-08-01", "name": "Old CPI",
+                            "severity": "high", "sessions": ["NIGHT"]}]})
+    findings, _ = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    assert any("0 upcoming (all expired)" in m for m in messages(findings, "P2"))
+
+
+def test_bridge_w1_calendar_state_failed_is_p2_and_degraded_is_p3(tmp_path, bridge):
+    write_json(bridge / "calendar_state.json", {
+        "last_check": iso(NOW - timedelta(hours=1)),
+        "fetch_status": "failed",
+        "sources_failed": ["fed_fomc", "bls", "bea", "nasdaq_earnings"],
+        "error_streak": 2,
+        "last_error": "timeout",
+    })
+    findings, _ = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    assert any("W1 calendar fetch failing" in m for m in messages(findings, "P2"))
+
+    write_json(bridge / "calendar_state.json", {
+        "last_check": iso(NOW - timedelta(hours=1)),
+        "fetch_status": "degraded",
+        "sources_failed": ["bea"],
+        "error_streak": 0,
+        "last_error": "bea: timeout",
+    })
+    findings2, _ = check_bridge(NOW, settings_for(bridge), str(tmp_path / "live"))
+    assert not any("W1 calendar fetch failing" in m for m in messages(findings2, "P2"))
+    assert any("W1 calendar degraded" in m for m in messages(findings2, "P3"))
+
+
 def test_bridge_silent_w2_monitor_is_p2(tmp_path, bridge):
     (bridge / "monitor.log").write_text(
         f"{(NOW - timedelta(hours=5)).strftime('%Y-%m-%d %H:%M:%S')} TPE | "

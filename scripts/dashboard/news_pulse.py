@@ -165,6 +165,8 @@ def _events(now: datetime, path: str, read_json) -> dict:
     events, err = parse_events(data)
     today = now.astimezone(_TZ_TPE).date().isoformat()
     upcoming = sorted((e for e in events if e.date >= today), key=lambda e: e.date)
+    if not err and events and not upcoming:
+        err = f"日曆 {len(events)} 筆事件皆已過期"
     return {"configured": True, "error": err, "items": [
         {"date": e.date, "name": news_feed._str(e.name, 120),
          "severity": e.severity, "sessions": list(e.sessions)}

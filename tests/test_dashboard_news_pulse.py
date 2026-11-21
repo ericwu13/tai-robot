@@ -217,3 +217,14 @@ def test_pulse_endpoint(pulse_server):
         body = json.loads(r.read())
     assert body["threshold"] == rss_scorer.SESSION_VOTE_THRESHOLD
     assert {"w3", "votes", "events", "drivers"} <= set(body)
+
+
+def test_pulse_flags_all_expired_events(tmp_path):
+    bridge = _bridge(tmp_path)
+    (bridge / "events.json").write_text(json.dumps({
+        "version": 1, "updated_at": NOW.isoformat(), "events": [
+            {"date": "2026-08-01", "name": "Old CPI", "severity": "high", "sessions": ["NIGHT"]},
+        ]}), encoding="utf-8")
+    out = news_pulse.pulse(NOW, None, _paths(bridge, ""), _reader)
+    assert out["events"]["items"] == []
+    assert "皆已過期" in out["events"]["error"]

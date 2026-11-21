@@ -517,6 +517,34 @@ class TestCalendarGate:
         runner._check_news(IN_SESSION + timedelta(seconds=301))
         assert len(parses) == 2
 
+    def test_night_only_event_does_not_suppress_preceding_day_session(self, tmp_path):
+        """Regression for Steven 2026-08-27: a NIGHT-only event must NOT
+        suppress the preceding DAY session (10:00 TPE); it engages only in the
+        closed gap before NIGHT (14:30 TPE) and during NIGHT (22:00 / 02:00)."""
+        runner = _make_runner(tmp_path, _news_cfg(tmp_path))
+        _write_events(
+            tmp_path / "events.json",
+            [{"date": "2026-07-10", "name": "US CPI", "severity": "high", "sessions": ["NIGHT"]}],
+            updated_at=IN_SESSION,
+        )
+        # Inside 2026-07-10 DAY (10:00 TPE) -> must NOT suppress!
+        runner._check_news(IN_SESSION)
+        assert runner.news_idle is False
+        assert runner.breaker_state.event_suppressed is False
+
+        # Closed gap before NIGHT (14:30 TPE) -> upcoming_event engages cleanly
+        tz = IN_SESSION.tzinfo
+        gap = datetime(2026, 7, 10, 14, 30, tzinfo=tz)
+        runner._check_news(gap)
+        assert runner.news_idle is True
+        assert runner.breaker_state.event_name == "US CPI"
+
+        # Active NIGHT session (22:00 TPE and 02:00 next day) -> stays suppressed
+        runner._check_news(datetime(2026, 7, 10, 22, 0, tzinfo=tz))
+        assert runner.news_idle is True
+        runner._check_news(datetime(2026, 7, 11, 2, 0, tzinfo=tz))
+        assert runner.news_idle is True
+
 
 # ── Restart: suppression + ledger survive ──
 

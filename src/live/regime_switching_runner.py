@@ -681,7 +681,14 @@ class RegimeSwitchingRunner(LiveRunner):
 
         min_sev = cfg.calendar_min_severity or "high"
         act_ev = None if stale else active_event(events, now, min_sev)
-        up_ev = None if stale else upcoming_event(events, now, min_sev)
+        # upcoming_event is for closed-gap apply-time only (event_calendar.py /
+        # circuit_breaker.py); evaluating it mid-session caused a NIGHT-only
+        # event to suppress the preceding DAY session as well (2026-08-27).
+        up_ev = (
+            None
+            if stale or current_session(now) is not None
+            else upcoming_event(events, now, min_sev)
+        )
         has_position = self.broker.has_open_position()
         decision = plan_calendar_gate(act_ev, up_ev, stale,
                                       self._breaker_state, has_position)

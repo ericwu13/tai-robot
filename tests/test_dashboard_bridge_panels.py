@@ -432,3 +432,24 @@ def test_local_paths_never_reach_the_client(bridge):
     assert "someuser" not in rows["W4"]["error"] and "x.json" in rows["W4"]["error"]
     assert "/home/bot" not in rows["W1"]["error"] and "events.json" in rows["W1"]["error"]
     assert wf.scrub_paths("HTTP 429 quota") == "HTTP 429 quota"
+
+
+def test_w1_expired_events_and_calendar_state_health(bridge):
+    put(bridge / "events.json", {
+        "updated_at": iso(NOW - timedelta(hours=2)),
+        "events": [{"date": "2026-08-12", "name": "Old CPI", "severity": "high", "sessions": ["NIGHT"]}],
+    })
+    rows = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))
+    assert rows["W1"]["status"] == "warn"
+    assert "皆已過期" in rows["W1"]["warning"]
+
+    put(bridge / "calendar_state.json", {
+        "last_check": iso(NOW - timedelta(hours=1)),
+        "fetch_status": "failed",
+        "sources_failed": ["fed_fomc", "bls"],
+        "error_streak": 2,
+        "last_error": "HTTP 503",
+    })
+    rows_bad = by_id(wf.workflows(NOW, paths_for(bridge), reader, run_lines))
+    assert rows_bad["W1"]["status"] == "bad"
+    assert "行事曆來源抓取失敗" in rows_bad["W1"]["error"]
