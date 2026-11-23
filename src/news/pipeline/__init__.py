@@ -263,7 +263,6 @@ class NewsSignalPipeline:
             market=market,
             emit_risk_off_enabled=emit_risk_off_enabled,
             interval_minutes=interval_minutes,
-            now=now,
         )
 
         # Persist classification summary + routed latch back onto active clusters

@@ -142,7 +142,7 @@ def load_market_snapshot(
 
 
 def check_bullish_market_confirm(
-    market: MarketSnapshot | None, cfg: RouterConfig, now: datetime | None = None,
+    market: MarketSnapshot | None, cfg: RouterConfig
 ) -> tuple[bool, str]:
     """Cross-validate a materiality-5 BULLISH catalyst against SKCOM / W2 quotes."""
     if not cfg.bullish_requires_price_vol_confirm:
@@ -178,18 +178,17 @@ def check_bullish_market_confirm(
         sym, pct = contra[0]
         return False, f"contradicted_by_{sym} ({pct:+.2f}%)"
 
-    # Regional veto only while ^TWII is closed (before 09:00 or from 14:00 TPE).
-    if not _twii_open(now):
-        for sym in cfg.bullish_contra_symbols:
-            q = market.quotes.get(sym)
-            if not isinstance(q, dict) or not q.get("fresh") or q.get("pct") is None:
-                continue
-            try:
-                pct = float(q["pct"])
-            except (TypeError, ValueError):
-                continue
-            if pct <= cfg.bullish_contra_max_drop_pct:
-                return False, f"regional_contradiction_{sym} ({pct:+.2f}%)"
+    # Also check regional Asian/EU semi proxies (catches divergence after ^TWII closes at 14:00 TPE)
+    for sym in cfg.bullish_contra_symbols:
+        q = market.quotes.get(sym)
+        if not isinstance(q, dict) or not q.get("fresh") or q.get("pct") is None:
+            continue
+        try:
+            pct = float(q["pct"])
+        except (TypeError, ValueError):
+            continue
+        if pct <= cfg.bullish_contra_max_drop_pct:
+            return False, f"regional_contradiction_{sym} ({pct:+.2f}%)"
 
     supporting = [(s, p) for s, p in fresh_moves if p >= cfg.bullish_confirm_min_pct]
     if supporting:
@@ -197,15 +196,6 @@ def check_bullish_market_confirm(
         return True, f"confirmed_by_{sym} ({pct:+.2f}%)"
 
     return False, "no_symbol_above_bullish_min_pct"
-
-
-def _twii_open(now: datetime | None) -> bool:
-    """^TWII cash session: 09:00 inclusive until 14:00 TPE. Otherwise closed."""
-    moment = now or datetime.now(_TZ_TAIPEI)
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=_TZ_TAIPEI)
-    hour = moment.astimezone(_TZ_TAIPEI).hour
-    return 9 <= hour < 14
 
 
 def check_bearish_market_confirm(
@@ -290,7 +280,6 @@ class SignalRouter:
         market: MarketSnapshot | None = None,
         *,
         emit_risk_off_enabled: bool = False,
-        now: datetime | None = None,
     ) -> RoutedSignal:
         # 1. Strict 5-condition release gate (Part A §3)
         if event.is_price_recap_only:
@@ -351,7 +340,7 @@ class SignalRouter:
             return RoutedSignal(
                 event, False, ACTION_DROP, "asymmetric_bullish_threshold", 0.0
             )
-        confirmed, mkt_note = check_bullish_market_confirm(market, self._rt, now)
+        confirmed, mkt_note = check_bullish_market_confirm(market, self._rt)
         if not confirmed:
             return RoutedSignal(
                 event=event,
@@ -407,12 +396,11 @@ class SignalRouter:
         market: MarketSnapshot | None = None,
         emit_risk_off_enabled: bool = False,
         interval_minutes: float = 30.0,
-        now: datetime | None = None,
     ) -> RouteBatchOutcome:
         """Route classified events and compute asymmetric session EMA & vote."""
         routed = [
             self.evaluate_event(
-                ev, market=market, emit_risk_off_enabled=emit_risk_off_enabled, now=now,
+                ev, market=market, emit_risk_off_enabled=emit_risk_off_enabled
             )
             for ev in events
         ]

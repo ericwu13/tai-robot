@@ -600,45 +600,10 @@ class TestLayer4Router:
                 "^HSI": {"pct": -3.03, "fresh": True},
             }
         )
-        # Pinned after 14:00 TPE: during the cash session this veto does not run.
-        res = self.router.evaluate_event(
-            ev, market=divergent, now=datetime(2026, 11, 23, 15, 0, tzinfo=_TZ_TPE),
-        )
+        res = self.router.evaluate_event(ev, market=divergent)
         assert res.passed is False
         assert res.action == ACTION_PENDING_MARKET_CONFIRM
         assert "regional_contradiction_^HSI" in res.reject_reason
-
-    def test_ks11_veto_only_while_twii_is_closed(self):
-        """11/23 10:00 TPE: TWII +0.80 and NQ +2.77 confirm; KS11 -3.51 does not veto.
-
-        The -1.5 regional cutoff is unchanged. After 14:00, and before the
-        09:00 open, the same tape is still a KS11 veto.
-        """
-        assert self.cfg.router.bullish_contra_max_drop_pct == -1.5
-        ev = self._ev(direction="BULLISH", materiality=5, source_tier=1, category="AI_SUPPLY_CHAIN")
-        mkt = MarketSnapshot(quotes={
-            "^TWII": {"pct": 0.80, "fresh": True},
-            "NQ=F": {"pct": 2.77, "fresh": True},
-            "^KS11": {"pct": -3.51, "fresh": True},
-        })
-        opened = self.router.evaluate_event(
-            ev, market=mkt, now=datetime(2026, 11, 23, 10, 0, tzinfo=_TZ_TPE),
-        )
-        assert opened.passed is True
-        assert opened.action == ACTION_VOTE_BULLISH
-        assert opened.market_note.startswith("confirmed_by_NQ=F")
-        assert "regional_contradiction" not in opened.reject_reason
-        for stamp in (datetime(2026, 11, 23, 9, 0, tzinfo=_TZ_TPE),
-                      datetime(2026, 11, 23, 13, 59, tzinfo=_TZ_TPE)):
-            still = self.router.evaluate_event(ev, market=mkt, now=stamp)
-            assert still.action == ACTION_VOTE_BULLISH, stamp
-        for stamp in (datetime(2026, 11, 23, 14, 0, tzinfo=_TZ_TPE),
-                      datetime(2026, 11, 23, 2, 0, tzinfo=_TZ_TPE),
-                      datetime(2026, 11, 23, 8, 59, tzinfo=_TZ_TPE)):
-            closed = self.router.evaluate_event(ev, market=mkt, now=stamp)
-            assert closed.passed is False, stamp
-            assert closed.action == ACTION_PENDING_MARKET_CONFIRM
-            assert "regional_contradiction_^KS11" in closed.reject_reason
 
     def test_vote_hysteresis_holds_single_shock_and_withdraws_below_floor(self):
         # Single Tier-2 M4 shock (-0.85) triggers trending-down immediately
