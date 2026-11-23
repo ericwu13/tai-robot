@@ -817,41 +817,6 @@ class TestRssScorerV2Integration:
         assert dup["representative_title"].startswith("Nvidia's accounting")
         assert dup["dup_method"]
 
-    def test_v2_pending_tracks_this_session_and_resets(self, tmp_path):
-        thu = datetime(2026, 11, 19, 21, 30, tzinfo=_TZ_TPE)
-        fri = datetime(2026, 11, 20, 21, 30, tzinfo=_TZ_TPE)
-        cfg = _v2_live_cfg(tmp_path)
-        art = _art(
-            "Fed Chair Warsh hikes rates 25 bps as 10-year Treasury yield tops 5.0%",
-            source="Bloomberg Markets", guid="g_fed",
-        )
-        p_cfg = load_pipeline_config()
-        clf = GeminiEventClassifier(
-            p_cfg, api_key="fake",
-            transport=lambda _p: _valid_event_json(
-                direction="BULLISH", category="MACRO_RATES",
-                summary_one_line="Fed signals a pause.",
-            ),
-        )
-        pipe = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf)
-        vote = str(tmp_path / "vote.json")
-        with (
-            mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[art]),
-            mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=pipe),
-        ):
-            state = rss_scorer.check_once(cfg, {"seen_guids": []}, vote, now=thu)
-        assert len(state["v2_pending"]) == 1
-        row = state["v2_pending"][0]
-        assert row["M"] == 5 and row["T"] == 1 and row["direction"] == "BULLISH"
-        assert row["reason"].startswith("bullish_unconfirmed:")
-        assert "Fed Chair" in row["title"] and row["at"].startswith("2026-11-19T21:30")
-        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
-            state = rss_scorer.check_once(cfg, state, vote, now=thu + timedelta(minutes=30))
-        assert len(state["v2_pending"]) == 1
-        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
-            state = rss_scorer.check_once(cfg, state, vote, now=fri)
-        assert state["v2_pending"] == []
-
     def test_v2_live_zero_new_articles_still_decays_and_withdraws_vote(self, tmp_path):
         vote_base = tmp_path / "regime_vote.json"
         session_key = rss_scorer.night_session_key(_FIXED_NOW)

@@ -1559,7 +1559,6 @@ def _run_v2_live(
     """Run 4-layer pipeline v2 as the primary W3 scorer (``rss_pipeline_v2: live``)."""
     _ensure_repo_on_path()
     from src.news.pipeline import (  # noqa: PLC0415
-        ACTION_PENDING_MARKET_CONFIRM,
         SignalRouter,
         load_market_snapshot,
         load_pipeline_config,
@@ -1567,8 +1566,6 @@ def _run_v2_live(
     )
 
     mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
-    if state.get("session_key") != session_key:
-        state["v2_pending"] = []
     # v1's session EMA (±1.5, 2h) and v2's (+1.0/-0.85, 10h, 0.45 hysteresis)
     # are different scales. Read the previous mode before this pass stamps
     # it: only an already-live pass keeps session_net.
@@ -1714,16 +1711,10 @@ def _run_v2_live(
         f"| run={net:+.2f}, session={cum:+.2f} -> vote: {direction or 'none'} "
         f"| {emb_note} ({report.elapsed_ms:.0f}ms)"
     )
-    pending = state.get("v2_pending") if isinstance(state.get("v2_pending"), list) else []
-    stamp = now.isoformat(timespec="seconds")
     for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
-        title = str(dec.article.get("title") or "").replace("\n", " ")
+        title = str(dec.article.get("title") or "").replace("\n", " ")[:80]
         print(f"    L4 {rsig.action} M{ev.materiality} T{ev.source_tier} "
-              f"{ev.direction} {rsig.reject_reason} {title[:80]}")
-        if rsig.action == ACTION_PENDING_MARKET_CONFIRM:
-            pending.append({"M": ev.materiality, "T": ev.source_tier, "direction": ev.direction,
-                            "reason": rsig.reject_reason, "title": title[:120], "at": stamp})
-    state["v2_pending"] = pending
+              f"{ev.direction} {rsig.reject_reason} {title}")
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
 
