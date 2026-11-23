@@ -519,10 +519,11 @@ def test_3021_in_the_gap_reconnects_after_settle_not_at_the_open(monkeypatch):
 
 
 def test_manual_reconnect_in_the_gap_is_not_held_until_the_open(monkeypatch):
-    """IsConnected 0 does not defer EnterMonitor until 08:45.
+    """The 07:30 timeout holds EnterMonitor until 08:30.
 
     The timeout tick itself is still inside the 5s settle, so the
-    quote is DOWN. Manual Reconnect at 07:40 enters now.
+    quote is DOWN. Manual Reconnect at 07:40 lifts that hold and
+    enters now.
     """
     drop = tpe(2026, 11, 12, 7, 30)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
@@ -533,7 +534,7 @@ def test_manual_reconnect_in_the_gap_is_not_held_until_the_open(monkeypatch):
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
     machine = app._link_host.machine
     assert machine.quote == LinkPhase.DOWN
-    assert machine._quote_enter_not_before is None
+    assert machine._quote_enter_not_before == tpe(2026, 11, 12, 8, 30)
     enters = fake.calls.count("EnterMonitorLONG")
     press = tpe(2026, 11, 12, 7, 40)
     clock["now"] = press
@@ -623,8 +624,9 @@ def test_0730_missing_3003_logs_clears_flag_and_starts_quote_down(monkeypatch):
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     assert app._quote_connected is True
-    # IsConnected 0 marks the quote down and does not wait for 08:45.
-    # The timeout tick is still inside the 5s settle, so no enter yet.
+    # IsConnected 0 marks the quote down and holds EnterMonitor until
+    # 08:30. The timeout tick is still inside the 5s settle, so no
+    # enter yet.
     fake.force_quote_state = 0
     before = len(logged)
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
@@ -633,7 +635,7 @@ def test_0730_missing_3003_logs_clears_flag_and_starts_quote_down(monkeypatch):
     assert app._quote_connected is False
     machine = app._link_host.machine
     assert machine.quote == LinkPhase.DOWN
-    assert machine._quote_enter_not_before is None
+    assert machine._quote_enter_not_before == tpe(2026, 11, 12, 8, 30)
     assert machine.degraded is False
     assert machine.orders_paused is False
     assert fake.calls.count("EnterMonitorLONG") == enters
@@ -709,6 +711,156 @@ def test_closed_gap_defers_enter_monitor_until_open(monkeypatch, drop, open_at):
     assert "LeaveMonitor" not in fake.calls
     assert fake.calls.count("LoginSetQuote") == 1
     assert "RestartProcess" not in fake.calls
+
+
+def _closed_gap_lead(open_at):
+    return open_at - timedelta(minutes=15)
+
+
+@pytest.mark.parametrize(
+    "drop,open_at",
+    [
+        (tpe(2026, 11, 12, 7, 30), tpe(2026, 11, 12, 8, 45)),
+        (tpe(2026, 11, 12, 14, 0), tpe(2026, 11, 12, 15, 0)),
+    ],
+)
+def test_closed_gap_is_connected_0_enters_at_the_lead(monkeypatch, drop, open_at):
+    """3002 with no 3003 and IsConnected 0 waits until open minus 15 min.
+
+    No EnterMonitorLONG before that instant. Exactly one at or after
+    it and before the open. 07:30 → 08:30; 14:00 → 14:45.
+    """
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _running(app)
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    lead = _closed_gap_lead(open_at)
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_enter_not_before == lead
+    assert rb.BacktestApp.CLOSED_GAP_ENTER_LEAD == timedelta(minutes=15)
+    assert machine._quote_stuck_not_before == open_at
+    cursor = drop + timedelta(minutes=1)
+    while cursor < lead:
+        _tick(app, fake, clock, cursor)
+        assert machine.degraded is False, cursor
+        assert fake.calls.count("EnterMonitorLONG") == enters, cursor
+        cursor += timedelta(minutes=1)
+    _tick(app, fake, clock, lead - timedelta(seconds=1))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, lead)
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.quote == LinkPhase.CONNECTING
+    # A later tick before the open can end the 60s connecting attempt.
+    # It must not call EnterMonitorLONG again.
+    _tick(app, fake, clock, open_at - timedelta(seconds=1))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.degraded is False
+    assert "LeaveMonitor" not in fake.calls
+    assert "RestartProcess" not in fake.calls
+    assert fake.calls.count("LoginSetQuote") == 1
+
+
+def test_closed_gap_inside_the_lead_enters_after_settle(monkeypatch):
+    """08:35 and IsConnected 0: the 15-min hold is already due.
+
+    Enter after the 5s settle. No extra wait until 08:45.
+    """
+    drop = tpe(2026, 11, 12, 8, 35)
+    open_at = tpe(2026, 11, 12, 8, 45)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    fake.force_quote_state = 0
+    assert app._closed_gap_enter_hold(drop, open_at) == _closed_gap_lead(open_at)
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    assert app._link_host.machine.quote == LinkPhase.DOWN
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, fired + timedelta(seconds=4))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    entered = fired + timedelta(seconds=5)
+    _tick(app, fake, clock, entered)
+    assert entered < open_at
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert app._link_host.machine.quote == LinkPhase.CONNECTING
+    assert app._link_host.machine.degraded is False
+
+
+def test_closed_gap_last_minute_still_waits_for_the_open(monkeypatch):
+    """#157: a drop inside the last minute waits until the open.
+
+    IsConnected 0 does not enter at 08:44. The open tick does.
+    """
+    drop = tpe(2026, 11, 12, 8, 44)
+    open_at = tpe(2026, 11, 12, 8, 45)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
+    _running(app)
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine._quote_enter_not_before == open_at
+    _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, open_at - timedelta(seconds=1))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert machine.degraded is False
+    _tick(app, fake, clock, open_at)
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.quote == LinkPhase.CONNECTING
+
+
+def test_closed_gap_unknown_next_open_enters_after_settle(monkeypatch):
+    """Next open unknown: same as master, enter after the 5s settle."""
+    drop = tpe(2026, 11, 12, 7, 30)
+    monkeypatch.setattr(rb, "_next_session_open", lambda now: None)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _running(app)
+    enters = fake.calls.count("EnterMonitorLONG")
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    fired = drop + timedelta(seconds=15)
+    _fire_timeout(app, fake, clock, fired)
+    machine = app._link_host.machine
+    assert machine.quote == LinkPhase.DOWN
+    assert machine._quote_enter_not_before is None
+    _tick(app, fake, clock, fired + timedelta(seconds=4))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.quote == LinkPhase.CONNECTING
+    assert machine.degraded is False
+
+
+def test_hold_across_close_keeps_the_closed_gap_lead(monkeypatch):
+    """A later across-close pass must not push the lead out to the open."""
+    drop = tpe(2026, 11, 12, 7, 30)
+    open_at = tpe(2026, 11, 12, 8, 45)
+    lead = _closed_gap_lead(open_at)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    assert machine._quote_enter_not_before == lead
+    assert machine._quote_hold_open_at == lead
+    mid = tpe(2026, 11, 12, 8, 0)
+    clock["now"] = mid
+    fake.set_now(mid)
+    app._hold_quote_down_across_close(mid)
+    assert machine._quote_enter_not_before == lead
+    assert machine._quote_hold_open_at == lead
+    assert machine._quote_stuck_not_before == open_at
+    enters = fake.calls.count("EnterMonitorLONG")
+    _tick(app, fake, clock, mid)
+    assert fake.calls.count("EnterMonitorLONG") == enters
 
 
 def test_open_session_timeout_enters_after_five_second_settle(monkeypatch):
@@ -1017,11 +1169,11 @@ def test_enter_monitor_return_code_is_logged(monkeypatch):
 def _closed_gap_down(monkeypatch, state=0):
     """07:30 3002 with no fresh tick.
 
-    ``state`` 0 does not defer EnterMonitor (the timeout tick is still
-    inside the 5s settle). Any other state holds EnterMonitor until
-    08:45 and makes no further SKCOM call during the gap. That hold is
-    the subscribed-runner case. An idle GUI with IsConnected not 0
-    stays pending and is covered separately.
+    ``state`` 0 holds EnterMonitor until 08:30 (the timeout tick is
+    still inside the 5s settle). Any other state holds EnterMonitor
+    until 08:45 and makes no further SKCOM call during the gap. That
+    hold is the subscribed-runner case. An idle GUI with IsConnected
+    not 0 stays pending and is covered separately.
     """
     drop = tpe(2026, 11, 12, 7, 30)
     open_at = tpe(2026, 11, 12, 8, 45)
@@ -1036,7 +1188,7 @@ def _closed_gap_down(monkeypatch, state=0):
     machine = app._link_host.machine
     assert machine.quote == LinkPhase.DOWN
     if state == 0:
-        assert machine._quote_enter_not_before is None
+        assert machine._quote_enter_not_before == _closed_gap_lead(open_at)
     else:
         assert machine._quote_enter_not_before == open_at
         assert fake.calls[calls_at_fire:] == ["IsConnected"]
@@ -1206,16 +1358,20 @@ def test_tick_without_runner_records_fresh_tick_clock(monkeypatch):
 def test_stale_tick_before_enter_monitor_does_not_restore_ready(monkeypatch):
     """(D) A tick from before EnterMonitorLONG must not restore READY."""
     app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
-    clock["now"] = open_at
-    fake.set_now(open_at)
+    lead = _closed_gap_lead(open_at)
+    # The tick lands during the hold, before the lead. It must not
+    # restore when the lead arrives.
+    early = lead - timedelta(minutes=10)
+    clock["now"] = early
+    fake.set_now(early)
     app._note_fresh_quote_tick()
     fake.force_quote_state = 0
-    _tick(app, fake, clock, open_at)
+    _tick(app, fake, clock, lead)
     machine = app._link_host.machine
     assert machine.quote == LinkPhase.CONNECTING
     assert fake.calls.count("EnterMonitorLONG") == enters + 1
     # The attempt ends. IsConnected comes back as 1. The old tick stays.
-    later = open_at + timedelta(seconds=61)
+    later = lead + timedelta(seconds=61)
     fake.force_quote_state = 0
     _tick(app, fake, clock, later)
     assert machine.quote == LinkPhase.DOWN
@@ -1223,8 +1379,9 @@ def test_stale_tick_before_enter_monitor_does_not_restore_ready(monkeypatch):
     _tick(app, fake, clock, later + timedelta(seconds=1))
     assert machine.quote != LinkPhase.READY
     assert machine._fresh_tick_at is None
-    assert machine._quote_timeout_hold is False
-    assert machine._quote_hold_open_at is None
+    # Enter was before the open, so the stuck pause is still ahead.
+    assert machine._quote_timeout_hold is True
+    assert machine._quote_hold_open_at == lead
 
 
 def test_hold_release_then_3021_still_cleans_up(monkeypatch):
@@ -1474,8 +1631,11 @@ def test_closed_gap_after_deploy_keeps_the_open_rules(monkeypatch):
     enters = fake.calls.count("EnterMonitorLONG")
     fired = drop + timedelta(seconds=36)
     _fire_pending(app, fake, clock, fired)
-    assert app._link_host.machine._quote_enter_not_before is None
+    lead = tpe(2026, 11, 12, 8, 30)
+    assert app._link_host.machine._quote_enter_not_before == lead
     _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, lead)
     assert fake.calls.count("EnterMonitorLONG") == enters + 1
     assert app._link_host.machine.degraded is False
 
@@ -1630,19 +1790,23 @@ def test_open_session_tick_60s_ago_marks_down(monkeypatch):
     assert app._quote_connected is False
 
 
-def test_0730_is_connected_0_enters_after_five_seconds(monkeypatch):
-    """07:30 and IsConnected 0: EnterMonitor about 5s later, not at 08:45."""
+def test_0730_is_connected_0_enters_at_the_lead(monkeypatch):
+    """07:30, no runner, IsConnected 0: enter at 08:30, not after 5s."""
     drop = tpe(2026, 11, 12, 7, 30)
-    app, fake, clock, _logged, enters, _open_at = _closed_gap_down(monkeypatch)
+    app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
+    lead = _closed_gap_lead(open_at)
     fired = drop + timedelta(seconds=15)
-    assert app._link_host.machine._quote_enter_not_before is None
+    assert app._link_host.machine._quote_enter_not_before == lead
     assert app._link_host.machine._quote_timeout_hold is True
-    _tick(app, fake, clock, fired + timedelta(seconds=4))
-    assert fake.calls.count("EnterMonitorLONG") == enters
     _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, lead - timedelta(seconds=1))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, lead)
     assert fake.calls.count("EnterMonitorLONG") == enters + 1
     assert app._link_host.machine.quote == LinkPhase.CONNECTING
     _tick(app, fake, clock, tpe(2026, 11, 12, 8, 44))
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
     assert app._link_host.machine.degraded is False
     assert "LeaveMonitor" not in fake.calls
     assert "RestartProcess" not in fake.calls
@@ -1878,14 +2042,17 @@ def test_subscription_window_stays_ready_on_a_fresh_tick(monkeypatch):
 
 
 def test_closed_gap_no_runner_is_connected_0_takes_178(monkeypatch):
-    """07:30, no runner, IsConnected 0: settle, then EnterMonitorLONG."""
+    """07:30, no runner, IsConnected 0: hold until 08:30, then enter."""
     drop = tpe(2026, 11, 12, 7, 30)
-    app, fake, clock, _logged, enters, _open_at = _closed_gap_down(monkeypatch)
+    app, fake, clock, _logged, enters, open_at = _closed_gap_down(monkeypatch)
     assert app._live_runner is None
     fired = drop + timedelta(seconds=15)
-    assert app._link_host.machine._quote_enter_not_before is None
+    lead = _closed_gap_lead(open_at)
+    assert app._link_host.machine._quote_enter_not_before == lead
     assert app._quote_connected is False
     _tick(app, fake, clock, fired + timedelta(seconds=5))
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    _tick(app, fake, clock, lead)
     assert fake.calls.count("EnterMonitorLONG") == enters + 1
     assert app._link_host.machine.quote == LinkPhase.CONNECTING
     assert app._link_host.machine.degraded is False
@@ -1895,7 +2062,8 @@ def test_idle_closed_gap_is_connected_1_stays_pending(monkeypatch):
     """07:30, no runner, IsConnected 1: no mark-down and no DEGRADED.
 
     The quote stays connected through 08:50. The label says the quote
-    is unverified. IsConnected()==0 is the case that still enters.
+    is unverified. IsConnected()==0 is the case that still starts the
+    quote-down path.
     """
     drop = tpe(2026, 11, 12, 7, 30)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))

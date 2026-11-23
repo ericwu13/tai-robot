@@ -289,16 +289,18 @@ class LinkStateMachine:
 
         The next ``tick`` runs the existing quote-down path: wait out
         ``quote_settle_s``, then EnterMonitorLONG only when
-        IsConnected()==0. ``enter_not_before`` is the host's next
-        session open. Until that instant the stuck timer does not run,
-        so a closed gap cannot reach DEGRADED. Passing None means the
-        session is open and the settle starts from this mark.
+        IsConnected()==0. ``enter_not_before`` is the host's hold.
+        Until that instant this tick does not call EnterMonitorLONG
+        and does not run the stuck timer, so a closed gap cannot
+        reach DEGRADED. Passing None means the settle starts from
+        this mark.
 
         ``release_at`` is set only for an open-session mark-down. A
         fresh tick at or after that instant restores READY. A closed
-        gap leaves it None: IsConnected()==0 still takes #178, and a
-        tick during the gap cannot restore. IsConnected() is not read
-        here.
+        gap passes the host's hold: the next open, or that open minus
+        the closed-gap lead when IsConnected()==0. None only when the
+        host has no next open. A tick before the hold cannot restore.
+        IsConnected() is not read here.
 
         Refuses unless the quote is READY. A CONNECTING or DOWN quote
         is a #178 attempt already in progress (or one already marked
@@ -314,7 +316,7 @@ class LinkStateMachine:
         self._quote_enter_not_before = enter_not_before
         # Open session passes release_at=now and no enter_not_before,
         # so the next fresh tick can restore. A closed gap passes the
-        # next open, or None when IsConnected()==0.
+        # host's hold: the next open, or the open minus the lead.
         # The anchor is the restore state. The other three fields are
         # the enter-hold and the stuck pause; clearing them must not
         # clear a due anchor, and a full end clears all four together.
@@ -966,8 +968,8 @@ class LinkStateMachine:
             return
         if self.reply == LinkPhase.DOWN and self.rules.one_link_at_a_time:
             return
-        # The host can hold EnterMonitor until a later instant (the
-        # next session open). Do not read IsConnected and do not start
+        # The host can hold EnterMonitor until a later instant.
+        # Do not read IsConnected and do not start
         # the stuck timer before it: stuck_limit across a closed gap
         # would DEGRADE and then wait for a manual Reconnect.
         # EnterMonitor in the minute before that instant is the #157 fault.
