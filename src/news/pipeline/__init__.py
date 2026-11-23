@@ -55,7 +55,6 @@ from .prefilter import (
 from .router import (
     ACTION_ADVISORY_LOW_TIER,
     ACTION_DROP,
-    ACTION_PENDING_MARKET_CONFIRM,
     ACTION_RISK_OFF,
     ACTION_VOTE_BEARISH,
     ACTION_VOTE_BULLISH,
@@ -64,7 +63,6 @@ from .router import (
     RoutedSignal,
     SignalRouter,
     check_bearish_market_confirm,
-    check_bullish_market_confirm,
     ema_decay_for,
     load_market_snapshot,
     write_risk_off_signal,
@@ -101,6 +99,7 @@ class PipelineRunReport:
     bullish_vote_threshold: float = 1.0
     vote_withdraw_threshold: float = 0.45
     ema_half_life_hours: float = 10.0
+    reweight_delta: float = 0.0
 
     @property
     def passed_count(self) -> int:
@@ -254,7 +253,19 @@ class NewsSignalPipeline:
                 if not (c.cluster_id in drop_ids and not c.classified_category)
             ]
 
-        # Layer 4: Signal routing + asymmetric thresholds + market cross-validation
+        # Breadth deltas for clusters already routed; this run's new events are excluded.
+        reweight_delta = 0.0
+        fresh_ids = {d.cluster_id for d in to_classify}
+        clusters = {c.cluster_id: c for c in self.clusterer.active}
+        for c in self.clusterer.active:
+            if not (c.routed and c.full_weight and c.cluster_id not in fresh_ids):
+                continue
+            target = round(c.full_weight * self.router.breadth_multiplier(len(c.outlets)), 4)
+            reweight_delta = round(reweight_delta + target - c.applied_weight, 4)
+            c.applied_weight = target
+        outlets_by_event = {cid: len(clusters[cid].outlets) for cid in fresh_ids if cid in clusters}
+
+        # Layer 4: one materiality floor, outlet breadth, bearish risk_off unchanged.
         events = [ev for _, ev in classified_items]
         routing = self.router.route_batch(
             events,
@@ -263,9 +274,10 @@ class NewsSignalPipeline:
             market=market,
             emit_risk_off_enabled=emit_risk_off_enabled,
             interval_minutes=interval_minutes,
+            outlets_by_event=outlets_by_event,
+            reweight_delta=reweight_delta,
         )
 
-        # Persist classification summary + routed latch back onto active clusters
         for (dec, ev), rsig in zip(classified_items, routing.routed_signals):
             self.clusterer.record_classification(
                 dec.cluster_id,
@@ -274,6 +286,8 @@ class NewsSignalPipeline:
                 direction=ev.direction,
                 materiality=ev.materiality,
                 routed=rsig.passed,
+                full_weight=rsig.full_score,
+                applied_weight=rsig.weighted_score,
             )
 
         # GUIDs safe to mark seen + per-article raw audit records (excludes any
@@ -305,7 +319,7 @@ class NewsSignalPipeline:
                         "cluster_id": d.cluster_id,
                         "dup_method": d.dup_method,
                         "similarity": d.similarity,
-                        "representative_title": rep_titles.get(d.cluster_id, ""),
+                        "matched_title": rep_titles.get(d.cluster_id, ""),
                     }
                 )
         for dec, err in l3_failed_items:
@@ -366,6 +380,7 @@ class NewsSignalPipeline:
             bullish_vote_threshold=self.config.router.bullish_vote_threshold,
             vote_withdraw_threshold=self.config.router.vote_withdraw_threshold,
             ema_half_life_hours=self.config.router.ema_half_life_hours,
+            reweight_delta=reweight_delta,
         )
 
 
@@ -402,7 +417,6 @@ __all__ = [
     "parse_classified_event",
     "ACTION_DROP",
     "ACTION_ADVISORY_LOW_TIER",
-    "ACTION_PENDING_MARKET_CONFIRM",
     "ACTION_RISK_OFF",
     "ACTION_VOTE_BEARISH",
     "ACTION_VOTE_BULLISH",
@@ -411,7 +425,6 @@ __all__ = [
     "RouteBatchOutcome",
     "SignalRouter",
     "load_market_snapshot",
-    "check_bullish_market_confirm",
     "check_bearish_market_confirm",
     "ema_decay_for",
     "write_risk_off_signal",

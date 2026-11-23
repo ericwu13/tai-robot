@@ -42,7 +42,6 @@ from scripts.dashboard import news_feed, news_pulse, news_trend  # noqa: E402
 from src.news.pipeline import (  # noqa: E402
     ACTION_ADVISORY_LOW_TIER,
     ACTION_DROP,
-    ACTION_PENDING_MARKET_CONFIRM,
     ACTION_RISK_OFF,
     ACTION_VOTE_BEARISH,
     ACTION_VOTE_BULLISH,
@@ -500,45 +499,30 @@ class TestLayer4Router:
         assert res.action == ACTION_ADVISORY_LOW_TIER
         assert res.weighted_score == 0.0
 
-    def test_asymmetric_bearish_mat4_passes_while_bullish_mat4_rejected(self):
-        bear4 = self.router.evaluate_event(self._ev(direction="BEARISH", materiality=4, source_tier=1))
-        assert bear4.passed is True
-        assert bear4.action == ACTION_VOTE_BEARISH
-        assert bear4.weighted_score == -1.0
+    def test_m4_tier2_bull_and_bear_share_one_floor(self):
+        bear = self.router.evaluate_event(self._ev(direction="BEARISH", materiality=4, source_tier=2))
+        bull = self.router.evaluate_event(self._ev(direction="BULLISH", materiality=4, source_tier=2))
+        assert bear.passed and bear.action == ACTION_VOTE_BEARISH
+        assert bull.passed and bull.action == ACTION_VOTE_BULLISH
+        assert bear.weighted_score == pytest.approx(-0.34)
+        assert bull.weighted_score == pytest.approx(0.34)
+        assert bear.full_score == pytest.approx(-0.68)
+        assert bull.full_score == pytest.approx(0.68)
 
-        bull_mkt = MarketSnapshot(quotes={"SOXX": {"pct": 1.8, "fresh": True}})
-        bull4 = self.router.evaluate_event(
-            self._ev(direction="BULLISH", materiality=4, source_tier=1), market=bull_mkt
-        )
-        assert bull4.passed is False
-        assert bull4.action == ACTION_DROP
-        assert bull4.reject_reason == "asymmetric_bullish_threshold"
-
-    def test_bullish_mat5_requires_market_price_confirmation(self):
+    def test_bullish_m5_routes_without_a_price_gate(self):
         ev = self._ev(
-            direction="BULLISH",
-            materiality=5,
-            source_tier=1,
-            category="MACRO_RATES",
+            direction="BULLISH", materiality=5, source_tier=1, category="MACRO_RATES",
             summary_one_line="Fed signals pause; 10Y yield drops below 4.8%.",
         )
-        # Without market data -> held as PENDING_MARKET_CONFIRM
-        unconfirmed = self.router.evaluate_event(ev, market=None)
-        assert unconfirmed.passed is False
-        assert unconfirmed.action == ACTION_PENDING_MARKET_CONFIRM
-
-        # With contradicting down tape -> held
-        contra_mkt = MarketSnapshot(quotes={"SOXX": {"pct": -1.5, "fresh": True}, "TSM": {"pct": 0.4, "fresh": True}})
-        held = self.router.evaluate_event(ev, market=contra_mkt)
-        assert held.passed is False
-        assert held.action == ACTION_PENDING_MARKET_CONFIRM
-
-        # With confirming SKCOM live bar -> passes!
-        skcom_mkt = MarketSnapshot(skcom_bar_pct=0.65, skcom_volume_ratio=1.3)
-        ok = self.router.evaluate_event(ev, market=skcom_mkt)
-        assert ok.passed is True
-        assert ok.action == ACTION_VOTE_BULLISH
-        assert ok.weighted_score == 1.0
+        adverse = MarketSnapshot(quotes={
+            "^KS11": {"pct": -3.51, "fresh": True}, "NQ=F": {"pct": 2.77, "fresh": True},
+            "^TWII": {"pct": 0.80, "fresh": True},
+        })
+        for market in (None, adverse, MarketSnapshot(skcom_bar_pct=-1.2)):
+            res = self.router.evaluate_event(ev, market=market)
+            assert res.passed and res.action == ACTION_VOTE_BULLISH
+            assert res.weighted_score == pytest.approx(0.5)
+            assert res.full_score == pytest.approx(1.0)
 
     def test_opt_in_risk_off_writes_valid_signal_file_readable_by_bot(self, tmp_path):
         weak_mkt = MarketSnapshot(quotes={"SOXX": {"pct": -1.8, "fresh": True}})
@@ -585,36 +569,18 @@ class TestLayer4Router:
         )
         snap = load_market_snapshot(str(sig_path), now=_FIXED_NOW, max_file_age_s=1800)
         assert snap.quotes["SOXX"]["fresh"] is False
+        # The file-age flag is unchanged. A bullish M5 no longer waits on that tape.
         ev = self._ev(direction="BULLISH", materiality=5, source_tier=1)
         res = self.router.evaluate_event(ev, market=snap)
-        assert res.passed is False
-        assert res.action == ACTION_PENDING_MARKET_CONFIRM
-        assert "no_fresh_confirm_quotes" in res.reject_reason
-
-    def test_regional_asian_contradiction_blocks_bullish_confirm(self):
-        ev = self._ev(direction="BULLISH", materiality=5, source_tier=1, category="AI_SUPPLY_CHAIN")
-        # US futures up +1.8%, but Hang Seng crashing -3.03% -> regional contradiction blocks bull vote
-        divergent = MarketSnapshot(
-            quotes={
-                "NQ=F": {"pct": 1.8, "fresh": True},
-                "^HSI": {"pct": -3.03, "fresh": True},
-            }
-        )
-        res = self.router.evaluate_event(ev, market=divergent)
-        assert res.passed is False
-        assert res.action == ACTION_PENDING_MARKET_CONFIRM
-        assert "regional_contradiction_^HSI" in res.reject_reason
+        assert res.passed and res.action == ACTION_VOTE_BULLISH
 
     def test_vote_hysteresis_holds_single_shock_and_withdraws_below_floor(self):
-        # Single Tier-2 M4 shock (-0.85) triggers trending-down immediately
         shock = self._ev(direction="BEARISH", materiality=4, source_tier=2)
         out = self.router.route_batch([shock], prev_session_net=0.0, active_vote_direction="")
-        assert out.session_net == -0.85
-        assert out.vote_direction == "trending-down"
+        assert out.session_net == pytest.approx(-0.34)
+        assert out.vote_direction is None  # one T2 M4 story is under the 0.85 line
 
-        # 16 quiet 30-min passes (8 hours) -> 10h half-life + 0.45 hysteresis holds the vote!
-        net = out.session_net
-        vote = out.vote_direction or ""
+        net, vote = -0.85, "trending-down"
         for _ in range(16):
             step = self.router.route_batch([], prev_session_net=net, active_vote_direction=vote)
             net = step.session_net
@@ -629,6 +595,132 @@ class TestLayer4Router:
             vote = step.vote_direction or ""
         assert abs(net) < 0.45
         assert vote == ""
+
+    def test_breadth_multiplier_reaches_full_at_four_outlets(self):
+        got = [self.router.breadth_multiplier(b) for b in range(1, 6)]
+        assert got[0] == pytest.approx(0.5)
+        assert got[1] == pytest.approx(2 / 3)
+        assert got[2] == pytest.approx(0.5 + 0.5 * 2 / 3)
+        assert got[3] == got[4] == 1.0
+
+    def test_nov23_stories_route_through_an_adverse_tape(self):
+        adverse = MarketSnapshot(quotes={
+            "^TWII": {"pct": 0.80, "fresh": True},
+            "NQ=F": {"pct": 2.77, "fresh": True},
+            "^KS11": {"pct": -3.51, "fresh": True},
+        })
+        ban = self.router.evaluate_event(
+            self._ev(direction="BULLISH", materiality=4, source_tier=2), market=adverse)
+        assert ban.action == ACTION_VOTE_BULLISH
+        assert ban.weighted_score == pytest.approx(0.34)
+        assert ban.full_score == pytest.approx(0.68)
+        one = self.router.evaluate_event(
+            self._ev(direction="BULLISH", materiality=5, source_tier=2), market=adverse, outlets=1)
+        two = self.router.evaluate_event(
+            self._ev(direction="BULLISH", materiality=5, source_tier=2), market=adverse, outlets=2)
+        four = self.router.evaluate_event(
+            self._ev(direction="BULLISH", materiality=5, source_tier=2), market=adverse, outlets=4)
+        assert one.weighted_score == pytest.approx(0.425)
+        assert one.full_score == pytest.approx(0.85)
+        assert two.weighted_score == pytest.approx(0.5667)
+        assert four.weighted_score == pytest.approx(0.85)
+
+
+class TestOutletBreadth:
+    def test_outlet_key_rules_and_legacy_round_trip(self):
+        from src.news.pipeline.dedup import EventCluster, outlet_key
+        assert outlet_key({"title": "Ban lifted - Reuters"}) == "reuters"
+        assert outlet_key({"title": "No separator here", "source": "Bloomberg Markets"}) == "bloomberg markets"
+        assert outlet_key({"title": "Story - Yahoo股市- 最新新聞"}) == "yahoo股市"
+        legacy = EventCluster.from_dict({
+            "cluster_id": "legacy", "representative_source": "CNBC", "source_tier": 2,
+        })
+        assert legacy.outlets == ["cnbc"]
+        again = EventCluster.from_dict(legacy.to_dict())
+        assert again.outlets == ["cnbc"] and again.full_weight == 0.0
+
+    def test_reweight_sums_to_full_minus_first_without_another_llm_call(self):
+        p_cfg = load_pipeline_config()
+        calls = {"n": 0}
+
+        def transport(_prompt: str) -> str:
+            calls["n"] += 1
+            return _valid_event_json(direction="BULLISH", materiality=5, category="AI_SUPPLY_CHAIN",
+                                     summary_one_line="Nvidia capacity guidance rises.")
+
+        pipe = NewsSignalPipeline(
+            p_cfg, embedder=LexicalFallbackEmbedder(64),
+            classifier=GeminiEventClassifier(p_cfg, api_key="fake", transport=transport),
+        )
+        base = "Exclusive-Nvidia's accounting is a focus of US SEC investigation"
+
+        def art(outlet, guid):
+            return _art(f"{base} - {outlet}", source=outlet, guid=guid, link=f"https://news.example.com/{guid}")
+
+        now = _FIXED_NOW
+        first = pipe.run([art("Reuters", "a")], now=now)
+        assert calls["n"] == 1
+        assert first.routing.run_net == pytest.approx(0.5)
+        assert first.reweight_delta == 0
+        cluster = pipe.clusterer.active[0]
+        assert cluster.full_weight == pytest.approx(1.0)
+        assert cluster.applied_weight == pytest.approx(0.5)
+
+        second = pipe.run([art("CNBC", "b")], now=now + timedelta(minutes=30))
+        third = pipe.run(
+            [art("MarketWatch", "c"), art("Financial Times", "d")],
+            now=now + timedelta(minutes=60),
+        )
+        assert calls["n"] == 1
+        assert len(cluster.outlets) == 4
+        assert cluster.applied_weight == pytest.approx(1.0)
+        assert first.reweight_delta + second.reweight_delta + third.reweight_delta == pytest.approx(0.5)
+
+        repeat = pipe.run([art("Reuters", "e")], now=now + timedelta(minutes=90))
+        assert calls["n"] == 1 and repeat.reweight_delta == 0 and len(cluster.outlets) == 4
+
+        archived = pipe.run([], now=now + timedelta(hours=5))
+        assert archived.reweight_delta == 0
+        assert cluster not in pipe.clusterer.active
+
+    def test_tier_upgrade_then_four_outlets_reaches_full_t2_weight(self):
+        p_cfg = load_pipeline_config()
+        calls = {"n": 0}
+
+        def transport(_prompt: str) -> str:
+            calls["n"] += 1
+            return _valid_event_json(
+                direction="BULLISH", materiality=5, category="GOVERNANCE_REGULATORY",
+                summary_one_line="Short-sale ban plus the stabilization fund.",
+            )
+
+        pipe = NewsSignalPipeline(
+            p_cfg, embedder=LexicalFallbackEmbedder(64),
+            classifier=GeminiEventClassifier(p_cfg, api_key="fake", transport=transport),
+        )
+        adverse = MarketSnapshot(quotes={"^KS11": {"pct": -3.51, "fresh": True}})
+        stem = "Exclusive-Nvidia's accounting is a focus of US SEC investigation"
+        now = datetime(2026, 11, 23, 10, 0, tzinfo=_TZ_TPE)
+
+        def one(outlet, source, guid, minutes):
+            moment = now + timedelta(minutes=minutes)
+            return pipe.run(
+                [_art(f"{stem} - {outlet}", source=source, guid=guid,
+                      link=f"https://news.example.com/{guid}", published_dt=moment)],
+                now=moment, market=adverse,
+            )
+
+        low = one("經濟日報", "ETtoday", "t3", 0)
+        assert low.passed_count == 0
+        upgraded = one("經濟日報", "經濟日報", "t2", 30)
+        assert upgraded.routing.run_net == pytest.approx(0.425)
+        assert pipe.clusterer.active[0].full_weight == pytest.approx(0.85)
+        assert pipe.clusterer.active[0].outlets == ["經濟日報"]
+        for i, outlet in enumerate(("CNBC", "MarketWatch", "WSJ")):
+            one(outlet, outlet, f"o{i}", 60 + 30 * i)
+        assert calls["n"] == 2
+        assert len(pipe.clusterer.active[0].outlets) == 4
+        assert pipe.clusterer.active[0].applied_weight == pytest.approx(0.85)
 
 
 # ── Phase 4/5 Integration: rss_scorer Feature Flag & Dashboard Parity ────
@@ -728,7 +820,8 @@ class TestRssScorerV2Integration:
         assert stats["l4_passed"] == 1
         assert stats["llm_calls_saved"] == 2
         assert state["pipeline_v2_mode"] == "live"
-        assert state["v2_active_vote"] == "trending-down"
+        assert state["v2_active_vote"] == ""
+        assert state["session_net"] > -0.85
 
         # Clusters live in sibling sidecar, NOT bloated into main state file
         assert "pipeline_v2_clusters" not in state
@@ -739,10 +832,7 @@ class TestRssScorerV2Integration:
 
         # Standard schema-v1 W3 vote file written & readable by RegimeSwitchingRunner
         session_key = rss_scorer.night_session_key(_FIXED_NOW)
-        vote = read_regime_vote(tmp_path / "regime_vote_w3.json", session_key)
-        assert vote is not None
-        assert vote.direction == "trending-down"
-        assert vote.source == "W3"
+        assert read_regime_vote(tmp_path / "regime_vote_w3.json", session_key) is None
 
         # No signal.json written because emit_risk_off is False
         assert not (tmp_path / "signal.json").exists()
@@ -814,7 +904,8 @@ class TestRssScorerV2Integration:
         dup = next(r for r in rows if r["pipeline_stage"] == "l2_duplicate")
         assert dup["similarity"] == 1.0
         assert dup["cluster_id"] == sample["cluster_id"]
-        assert dup["representative_title"].startswith("Nvidia's accounting")
+        assert dup["matched_title"].startswith("Nvidia's accounting")
+        assert dup["similarity"] == sample["similarity"]
         assert dup["dup_method"]
 
     def test_v2_live_zero_new_articles_still_decays_and_withdraws_vote(self, tmp_path):
@@ -915,9 +1006,9 @@ class TestRssScorerV2Integration:
         assert state["last_net_score"] < 0
         assert state["session_net"] == pytest.approx(state["last_net_score"])
         assert state["session_net"] != pytest.approx(carried)
-        assert state["v2_active_vote"] == "trending-down"
-        vote = read_regime_vote(tmp_path / "regime_vote_w3.json", session_key)
-        assert vote is not None and vote.direction == "trending-down"
+        assert state["last_net_score"] == pytest.approx(-0.5)
+        assert state["v2_active_vote"] == ""
+        assert read_regime_vote(tmp_path / "regime_vote_w3.json", session_key) is None
 
     def test_v2_live_inherits_session_net_when_already_live(self, tmp_path):
         vote_base = tmp_path / "regime_vote.json"
@@ -1039,7 +1130,7 @@ class TestRssScorerV2Integration:
         assert not (tmp_path / "regime_vote_w3.json").exists()
         assert state["pipeline_v2_mode"] == "shadow"
         assert state["v2_session_net"] < 0
-        assert state["pipeline_v2_last_stats"]["vote_direction"] == "trending-down"
+        assert state["pipeline_v2_last_stats"]["vote_direction"] == ""
         assert state["pipeline_v2_shadow_error"] == ""
         assert "pipeline_v2_clusters" not in state
         assert (tmp_path / rss_scorer.PIPELINE_V2_STATE_FILENAME).exists()
@@ -1131,8 +1222,8 @@ class TestRssScorerV2Integration:
         assert res1.l2_duplicates == 1
         assert res1.api_calls == 2
         assert calls["n"] == 2
-        assert res1.l4_passed == 1  # SEC bearish M5 passed; TSMC bullish M4 rejected by asymmetric gate
-        assert res1.votes_down == 2  # held by 10h EMA + hysteresis across +90m!
+        assert res1.l4_passed == 2  # M4 bull now passes; one story is still under the vote line
+        assert res1.votes_down == 0
 
         # Re-run with same cache -> 0 new Gemini calls!
         clf2 = backfill_news_v2.CachedClassifier(
@@ -1169,7 +1260,7 @@ class TestRssScorerV2Integration:
         saved_state = json.loads(state_file.read_text(encoding="utf-8"))
         assert "existing_guid" in saved_state["seen_guids"]  # preserved!
         assert saved_state["pipeline_v2_mode"] == "live"
-        assert saved_state["v2_active_vote"] == "trending-down"
+        assert saved_state["v2_active_vote"] == ""
         assert "pipeline_v2_clusters" not in saved_state
 
         # Dashboard pulse + feed + trend all read ONLY the clean backfilled v2 data (not raw/)
@@ -1182,9 +1273,9 @@ class TestRssScorerV2Integration:
             lambda p: json.loads(Path(p).read_text(encoding="utf-8")) if Path(p).is_file() else None,
         )
         assert pulse["threshold"] == pytest.approx(0.85)
-        assert pulse["w3"]["direction"] == "trending-down"
+        assert pulse["w3"]["direction"] == ""  # one bearish story no longer clears 0.85
         assert len(pulse["drivers"]["down"]) == 1
-        # Unclipped v2 driver contribution (materiality 5 -> score -1.0, decayed 1 run at 10h half-life)
+        # The log still stores the legacy signed materiality, not the breadth weight.
         assert pulse["drivers"]["down"][0]["contribution"] < -0.90
         runs = news_trend.read_runs(str(log_base))
         assert len(runs) == 2

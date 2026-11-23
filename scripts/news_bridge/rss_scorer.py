@@ -1690,7 +1690,7 @@ def _run_v2_live(
                 cluster_id=item.get("cluster_id", ""),
                 dup_method=item.get("dup_method", ""),
                 similarity=item.get("similarity"),
-                representative_title=item.get("representative_title", ""),
+                matched_title=item.get("matched_title", ""),
                 v2_action=item.get("v2_action", ""),
                 v2_category=item.get("v2_category", ""),
                 v2_direction=item.get("v2_direction", ""),
@@ -1712,9 +1712,18 @@ def _run_v2_live(
         f"| {emb_note} ({report.elapsed_ms:.0f}ms)"
     )
     for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
-        title = str(dec.article.get("title") or "").replace("\n", " ")[:80]
-        print(f"    L4 {rsig.action} M{ev.materiality} T{ev.source_tier} "
-              f"{ev.direction} {rsig.reject_reason} {title}")
+        title = str(dec.article.get("title") or "").replace("\n", " ")[:60]
+        print(f"    L4 {rsig.action} M{ev.materiality} T{ev.source_tier} {ev.direction} "
+              f"{rsig.weighted_score}/{rsig.full_score} {rsig.reject_reason} {title}")
+    if report.reweight_delta:
+        print(f"    reweight {report.reweight_delta:+.4f}")
+    state["v2_partial"] = [
+        {"title": c.representative_title[:80], "direction": c.classified_direction,
+         "materiality": c.classified_materiality, "tier": c.source_tier,
+         "outlets": len(c.outlets), "weight": c.applied_weight, "full": c.full_weight}
+        for c in pipe.clusterer.active
+        if c.routed and abs(c.applied_weight) < abs(c.full_weight)
+    ][:10]
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
 
@@ -1890,7 +1899,7 @@ def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
         save_state(state_path, state)
         run.exit_code = 0
         if in_weekend_pause(now):
-            run.result = "weekend pause (Sat 05:00–Mon 05:00 TPE): scoring skipped"
+            run.result = "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
         else:
             run.result = (f"fetched {state.get('last_fetched', '-')} | "
                           f"new {state.get('last_new', '-')} | "

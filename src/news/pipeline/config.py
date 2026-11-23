@@ -98,13 +98,9 @@ class ClassifierConfig:
 
 @dataclass(frozen=True)
 class RouterConfig:
-    min_materiality_bearish: int = 4
-    min_materiality_bullish: int = 5
-    bullish_requires_price_vol_confirm: bool = True
-    bullish_confirm_min_pct: float = 0.3
+    first_sighting_weight: float = 0.5
+    full_weight_outlets: int = 4
     bullish_confirm_symbols: tuple[str, ...] = ("TSM", "SOXX", "QQQ", "NQ=F", "^TWII")
-    bullish_contra_symbols: tuple[str, ...] = ("^N225", "^KS11", "^HSI", "ASML.AS")
-    bullish_contra_max_drop_pct: float = -1.5
     market_snapshot_max_age_s: int = 1800
     tier3_can_trigger_vote: bool = False
     bearish_vote_threshold: float = 0.85
@@ -209,17 +205,11 @@ def _build_config(raw: dict[str, Any], source_path: str) -> PipelineConfig:
             ))),
         ),
         router=RouterConfig(
-            min_materiality_bearish=int(rt.get("min_materiality_bearish", 4)),
-            min_materiality_bullish=int(rt.get("min_materiality_bullish", 5)),
-            bullish_requires_price_vol_confirm=bool(rt.get("bullish_requires_price_vol_confirm", True)),
-            bullish_confirm_min_pct=float(rt.get("bullish_confirm_min_pct", 0.3)),
+            first_sighting_weight=float(rt.get("first_sighting_weight", 0.5)),
+            full_weight_outlets=int(rt.get("full_weight_outlets", 4)),
             bullish_confirm_symbols=tuple(str(s) for s in (rt.get("bullish_confirm_symbols") or (
                 "TSM", "SOXX", "QQQ", "NQ=F", "^TWII"
             ))),
-            bullish_contra_symbols=tuple(str(s) for s in (rt.get("bullish_contra_symbols") or (
-                "^N225", "^KS11", "^HSI", "ASML.AS"
-            ))),
-            bullish_contra_max_drop_pct=float(rt.get("bullish_contra_max_drop_pct", -1.5)),
             market_snapshot_max_age_s=int(rt.get("market_snapshot_max_age_s", 1800)),
             tier3_can_trigger_vote=bool(rt.get("tier3_can_trigger_vote", False)),
             bearish_vote_threshold=float(rt.get("bearish_vote_threshold", 0.85)),

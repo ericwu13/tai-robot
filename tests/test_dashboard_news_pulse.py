@@ -141,6 +141,16 @@ def test_w3_state_missing_file():
     assert news_pulse.w3_state(None, NOW, SESSION, 1.5) == {"known": False}
 
 
+def test_w3_state_partial_is_only_the_current_session():
+    row = {"title": "限空令", "direction": "BULLISH", "materiality": 5, "tier": 2,
+           "outlets": 1, "weight": 0.425, "full": 0.85}
+    st = news_pulse.w3_state({"session_key": SESSION, "v2_partial": [row, "nope"]}, NOW, SESSION, 1.5)
+    assert st["partial"] == [row]
+    old = news_pulse.w3_state(
+        {"session_key": "2026-08-03|NIGHT", "v2_partial": [row]}, NOW, SESSION, 1.5)
+    assert old["partial"] == []
+
+
 def _bridge(tmp_path):
     bridge = tmp_path / "bridge"
     bridge.mkdir()

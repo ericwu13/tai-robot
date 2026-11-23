@@ -1,24 +1,13 @@
-"""Layer 4 — Signal routing, source tiering, asymmetric gates, and market hooks.
+"""Layer 4 — Signal routing, source tiering, and outlet breadth.
 
 Responsibilities:
-- Enforce the strict 5-condition release gate:
-    is_price_recap_only == False
-    and is_duplicate == False
-    and has_new_fact_delta == True
-    and category != "DROP"
-    and materiality >= min_materiality_pass (4)
-- Apply source-tier weighting (Tier 1 > Tier 2 > Tier 3; Tier 3 alone never
-  triggers a vote or risk_off).
-- Enforce asymmetric bullish/bearish thresholds to counter financial media's
-  structural optimism bias:
-    - BEARISH (materiality >= 4, Tier 1/2): immediately eligible for defensive
-      vote ("trending-down") and high-priority Discord alert (and opt-in
-      signal.json risk_off ONLY when explicitly enabled via rss_emit_risk_off).
-    - BULLISH (materiality == 5 ONLY, Tier 1/2): requires cross-market / SKCOM
-      price-volume confirmation before emitting a bullish vote ("trending-up").
-- Never bypass SKCOM real-time quotes or TradingGuard: the router only emits
-  file-contract outputs (regime_vote_w3.json, optional opt-in risk_off signal)
-  consumed by RegimeSwitchingRunner's existing safety gates.
+- Release gate: not a price recap, not a duplicate, has a new fact, category
+  is not DROP, direction is not NEUTRAL, materiality >= min_materiality_pass (4).
+  One floor for bull and bear. Tier 3 alone never triggers a vote or risk_off.
+- Full weight is sign * (materiality / 5) * tier_weight. The first distinct
+  outlet scores first_sighting_weight of that; full weight at full_weight_outlets.
+- Opt-in bearish risk_off still requires check_bearish_market_confirm.
+- The router only emits file-contract outputs for RegimeSwitchingRunner.
 """
 from __future__ import annotations
 
@@ -40,7 +29,6 @@ _QUOTES_FILENAME = "crossmarket_quotes.json"
 # Routed action constants
 ACTION_DROP = "DROP"
 ACTION_ADVISORY_LOW_TIER = "ADVISORY_LOW_TIER"
-ACTION_PENDING_MARKET_CONFIRM = "PENDING_MARKET_CONFIRM"
 ACTION_VOTE_BEARISH = "VOTE_BEARISH"
 ACTION_VOTE_BULLISH = "VOTE_BULLISH"
 ACTION_RISK_OFF = "RISK_OFF"
@@ -141,63 +129,6 @@ def load_market_snapshot(
     )
 
 
-def check_bullish_market_confirm(
-    market: MarketSnapshot | None, cfg: RouterConfig
-) -> tuple[bool, str]:
-    """Cross-validate a materiality-5 BULLISH catalyst against SKCOM / W2 quotes."""
-    if not cfg.bullish_requires_price_vol_confirm:
-        return True, "market_confirm_disabled"
-    if market is None:
-        return False, "no_market_snapshot"
-
-    # Prefer direct SKCOM live price/volume hook when available
-    if market.skcom_bar_pct is not None:
-        if market.skcom_bar_pct >= cfg.bullish_confirm_min_pct:
-            vol_ok = market.skcom_volume_ratio is None or market.skcom_volume_ratio >= 1.0
-            if vol_ok:
-                return True, f"skcom_confirmed ({market.skcom_bar_pct:+.2f}%)"
-            return False, f"skcom_low_volume (ratio={market.skcom_volume_ratio:.2f})"
-        return False, f"skcom_not_confirming ({market.skcom_bar_pct:+.2f}%)"
-
-    fresh_moves: list[tuple[str, float]] = []
-    for sym in cfg.bullish_confirm_symbols:
-        q = market.quotes.get(sym)
-        if not isinstance(q, dict) or not q.get("fresh") or q.get("pct") is None:
-            continue
-        try:
-            fresh_moves.append((sym, float(q["pct"])))
-        except (TypeError, ValueError):
-            continue
-
-    if not fresh_moves:
-        return False, "no_fresh_confirm_quotes"
-
-    # Reject if any core proxy is sharply contradicting on the downside
-    contra = [(s, p) for s, p in fresh_moves if p <= -1.0]
-    if contra:
-        sym, pct = contra[0]
-        return False, f"contradicted_by_{sym} ({pct:+.2f}%)"
-
-    # Also check regional Asian/EU semi proxies (catches divergence after ^TWII closes at 14:00 TPE)
-    for sym in cfg.bullish_contra_symbols:
-        q = market.quotes.get(sym)
-        if not isinstance(q, dict) or not q.get("fresh") or q.get("pct") is None:
-            continue
-        try:
-            pct = float(q["pct"])
-        except (TypeError, ValueError):
-            continue
-        if pct <= cfg.bullish_contra_max_drop_pct:
-            return False, f"regional_contradiction_{sym} ({pct:+.2f}%)"
-
-    supporting = [(s, p) for s, p in fresh_moves if p >= cfg.bullish_confirm_min_pct]
-    if supporting:
-        sym, pct = max(supporting, key=lambda x: x[1])
-        return True, f"confirmed_by_{sym} ({pct:+.2f}%)"
-
-    return False, "no_symbol_above_bullish_min_pct"
-
-
 def check_bearish_market_confirm(
     market: MarketSnapshot | None, cfg: RouterConfig
 ) -> tuple[bool, str]:
@@ -242,6 +173,7 @@ class RoutedSignal:
     action: str               # ACTION_* constant
     reject_reason: str
     weighted_score: float     # signed impact fed into session EMA
+    full_score: float = 0.0   # weight before the outlet-breadth multiplier
     emit_risk_off: bool = False
     discord_alert: bool = False
     market_note: str = ""
@@ -266,7 +198,7 @@ def ema_decay_for(half_life_hours: float, interval_minutes: float = 30.0) -> flo
 
 
 class SignalRouter:
-    """Layer 4 router enforcing strict release gates and asymmetric thresholds."""
+    """Layer 4 router: one materiality floor and outlet-breadth weighting."""
 
     def __init__(self, config: PipelineConfig):
         self._cfg: PipelineConfig = config
@@ -274,12 +206,22 @@ class SignalRouter:
         self._tiers: SourceTierConfig = config.source_tiers
         self._min_mat_pass: int = config.classifier.min_materiality_pass
 
+    def breadth_multiplier(self, outlets: int) -> float:
+        """cap at 1 outlet, 1.0 once distinct outlets reach full_weight_outlets."""
+        cap = float(self._rt.first_sighting_weight)
+        breadth = max(1, int(self._rt.full_weight_outlets))
+        seen = max(1, int(outlets))
+        if seen >= breadth:
+            return 1.0
+        return min(1.0, cap + (1.0 - cap) * (seen - 1) / (breadth - 1))
+
     def evaluate_event(
         self,
         event: ClassifiedEvent,
         market: MarketSnapshot | None = None,
         *,
         emit_risk_off_enabled: bool = False,
+        outlets: int = 1,
     ) -> RoutedSignal:
         # 1. Strict 5-condition release gate (Part A §3)
         if event.is_price_recap_only:
@@ -307,13 +249,10 @@ class SignalRouter:
                 discord_alert=False,
             )
 
-        # 3. Asymmetric directional gates
+        sign = -1.0 if event.direction == "BEARISH" else 1.0
+        full = sign * round((event.materiality / 5.0) * tier_weight, 4)
+        weighted = round(full * self.breadth_multiplier(outlets), 4)
         if event.direction == "BEARISH":
-            if event.materiality < self._rt.min_materiality_bearish:
-                return RoutedSignal(
-                    event, False, ACTION_DROP, "below_bearish_materiality", 0.0
-                )
-            score = -round((event.materiality / 4.0) * tier_weight, 4)
             wants_risk_off = False
             mkt_note = ""
             if (
@@ -323,44 +262,25 @@ class SignalRouter:
             ):
                 ok, mkt_note = check_bearish_market_confirm(market, self._rt)
                 wants_risk_off = ok
-            action = ACTION_RISK_OFF if wants_risk_off else ACTION_VOTE_BEARISH
             return RoutedSignal(
                 event=event,
                 passed=True,
-                action=action,
+                action=ACTION_RISK_OFF if wants_risk_off else ACTION_VOTE_BEARISH,
                 reject_reason="",
-                weighted_score=score,
+                weighted_score=weighted,
+                full_score=full,
                 emit_risk_off=wants_risk_off,
                 discord_alert=event.materiality >= self._rt.discord_alert_min_materiality,
                 market_note=mkt_note,
             )
-
-        # BULLISH — stricter materiality (default 5) + SKCOM/W2 price-volume confirm
-        if event.materiality < self._rt.min_materiality_bullish:
-            return RoutedSignal(
-                event, False, ACTION_DROP, "asymmetric_bullish_threshold", 0.0
-            )
-        confirmed, mkt_note = check_bullish_market_confirm(market, self._rt)
-        if not confirmed:
-            return RoutedSignal(
-                event=event,
-                passed=False,
-                action=ACTION_PENDING_MARKET_CONFIRM,
-                reject_reason=f"bullish_unconfirmed:{mkt_note}",
-                weighted_score=0.0,
-                discord_alert=False,
-                market_note=mkt_note,
-            )
-        score = round((event.materiality / 5.0) * tier_weight, 4)
         return RoutedSignal(
             event=event,
             passed=True,
             action=ACTION_VOTE_BULLISH,
             reject_reason="",
-            weighted_score=score,
-            emit_risk_off=False,
+            weighted_score=weighted,
+            full_score=full,
             discord_alert=event.materiality >= self._rt.discord_alert_min_materiality,
-            market_note=mkt_note,
         )
 
     def resolve_vote_direction(
@@ -396,15 +316,19 @@ class SignalRouter:
         market: MarketSnapshot | None = None,
         emit_risk_off_enabled: bool = False,
         interval_minutes: float = 30.0,
+        outlets_by_event: dict[str, int] | None = None,
+        reweight_delta: float = 0.0,
     ) -> RouteBatchOutcome:
-        """Route classified events and compute asymmetric session EMA & vote."""
+        """Route classified events and compute the session EMA and vote."""
+        counts = outlets_by_event or {}
         routed = [
             self.evaluate_event(
-                ev, market=market, emit_risk_off_enabled=emit_risk_off_enabled
+                ev, market=market, emit_risk_off_enabled=emit_risk_off_enabled,
+                outlets=counts.get(ev.event_id, 1),
             )
             for ev in events
         ]
-        run_net = round(sum(r.weighted_score for r in routed), 4)
+        run_net = round(sum(r.weighted_score for r in routed) + float(reweight_delta), 4)
         decay = ema_decay_for(self._rt.ema_half_life_hours, interval_minutes)
         session_net = round(float(prev_session_net) * decay + run_net, 4)
         vote_dir = self.resolve_vote_direction(session_net, active_vote_direction)

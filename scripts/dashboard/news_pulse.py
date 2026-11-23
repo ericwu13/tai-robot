@@ -157,6 +157,8 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
         "last_new": count("last_new"),
         "last_scored": count("last_articles_scored"),
         "last_skipped": count("last_skipped"),
+        "partial": ([p for p in state.get("v2_partial") if isinstance(p, dict)][:10]
+                    if current and isinstance(state.get("v2_partial"), list) else []),
     }
 
 

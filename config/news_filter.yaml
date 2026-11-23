@@ -183,31 +183,23 @@ classifier:
     - STRUCTURAL
 
 router:
-  min_materiality_bearish: 4
-  min_materiality_bullish: 5
-  bullish_requires_price_vol_confirm: true
-  bullish_confirm_min_pct: 0.3
+  # First sighting is this fraction of full weight; full weight at this many outlets.
+  # Bull and bear share classifier.min_materiality_pass. risk_off still reads
+  # bullish_confirm_symbols. bullish_vote_threshold stays 1.0 (replay used 0.85).
+  first_sighting_weight: 0.5
+  full_weight_outlets: 4
   bullish_confirm_symbols:
     - TSM
     - SOXX
     - QQQ
     - 'NQ=F'
     - '^TWII'
-  # Regional proxies checked for sharp downside contradiction after ^TWII closes (14:00 TPE).
-  bullish_contra_symbols:
-    - '^N225'
-    - '^KS11'
-    - '^HSI'
-    - 'ASML.AS'
-  bullish_contra_max_drop_pct: -1.5
   market_snapshot_max_age_s: 1800
   tier3_can_trigger_vote: false
   bearish_vote_threshold: 0.85
   bullish_vote_threshold: 1.0
-  # Hysteresis withdrawal band: v2 deduplicated catalysts fire ONCE per 4-48h and
-  # RegimeSwitchingRunner only reads regime_vote_w3.json at ~04:58 TPE. A 10h
-  # half-life + 0.45 withdrawal threshold lets a single T1/T2 M4-M5 shock survive
-  # across the US/EU night session (~9-15h) unless counter-catalysts offset it.
+  # A standing vote holds until session_net fades inside ±vote_withdraw_threshold.
+  # One outlet no longer reaches the entry line by itself.
   vote_withdraw_threshold: 0.45
   ema_half_life_hours: 10.0
   emit_risk_off_min_materiality: 4

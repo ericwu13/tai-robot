@@ -446,7 +446,7 @@ def test_weekend_pause_run_row_drops_stale_counts(tmp_path):
     rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path, now=saturday)
     row = _runs(state_path)[-1]
     assert row["ok"] is True and row["exit_code"] == 0
-    assert row["result"] == "weekend pause (Sat 05:00–Mon 05:00 TPE): scoring skipped"
+    assert row["result"] == "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
     assert "fetched" not in row["result"] and "net" not in row["result"]
     assert "1.25" not in row["result"] and "40" not in row["result"]
 
