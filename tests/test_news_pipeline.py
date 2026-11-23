@@ -600,10 +600,45 @@ class TestLayer4Router:
                 "^HSI": {"pct": -3.03, "fresh": True},
             }
         )
-        res = self.router.evaluate_event(ev, market=divergent)
+        # Pinned after 14:00 TPE: during the cash session this veto does not run.
+        res = self.router.evaluate_event(
+            ev, market=divergent, now=datetime(2026, 11, 23, 15, 0, tzinfo=_TZ_TPE),
+        )
         assert res.passed is False
         assert res.action == ACTION_PENDING_MARKET_CONFIRM
         assert "regional_contradiction_^HSI" in res.reject_reason
+
+    def test_ks11_veto_only_while_twii_is_closed(self):
+        """11/23 10:00 TPE: TWII +0.80 and NQ +2.77 confirm; KS11 -3.51 does not veto.
+
+        The -1.5 regional cutoff is unchanged. After 14:00, and before the
+        09:00 open, the same tape is still a KS11 veto.
+        """
+        assert self.cfg.router.bullish_contra_max_drop_pct == -1.5
+        ev = self._ev(direction="BULLISH", materiality=5, source_tier=1, category="AI_SUPPLY_CHAIN")
+        mkt = MarketSnapshot(quotes={
+            "^TWII": {"pct": 0.80, "fresh": True},
+            "NQ=F": {"pct": 2.77, "fresh": True},
+            "^KS11": {"pct": -3.51, "fresh": True},
+        })
+        opened = self.router.evaluate_event(
+            ev, market=mkt, now=datetime(2026, 11, 23, 10, 0, tzinfo=_TZ_TPE),
+        )
+        assert opened.passed is True
+        assert opened.action == ACTION_VOTE_BULLISH
+        assert opened.market_note.startswith("confirmed_by_NQ=F")
+        assert "regional_contradiction" not in opened.reject_reason
+        for stamp in (datetime(2026, 11, 23, 9, 0, tzinfo=_TZ_TPE),
+                      datetime(2026, 11, 23, 13, 59, tzinfo=_TZ_TPE)):
+            still = self.router.evaluate_event(ev, market=mkt, now=stamp)
+            assert still.action == ACTION_VOTE_BULLISH, stamp
+        for stamp in (datetime(2026, 11, 23, 14, 0, tzinfo=_TZ_TPE),
+                      datetime(2026, 11, 23, 2, 0, tzinfo=_TZ_TPE),
+                      datetime(2026, 11, 23, 8, 59, tzinfo=_TZ_TPE)):
+            closed = self.router.evaluate_event(ev, market=mkt, now=stamp)
+            assert closed.passed is False, stamp
+            assert closed.action == ACTION_PENDING_MARKET_CONFIRM
+            assert "regional_contradiction_^KS11" in closed.reject_reason
 
     def test_vote_hysteresis_holds_single_shock_and_withdraws_below_floor(self):
         # Single Tier-2 M4 shock (-0.85) triggers trending-down immediately
@@ -767,6 +802,90 @@ class TestRssScorerV2Integration:
         # Directly replayable by replay_news_pipeline / backfill_news_v2
         replayed = replay_news_pipeline.load_jsonl_batches(str(raw_path))
         assert sum(len(a) for _, a in replayed) == 3
+
+    def test_v2_live_logs_one_line_per_classified_item(self, tmp_path, capsys):
+        cfg = _v2_live_cfg(tmp_path)
+        art = _art(
+            "Exclusive-Nvidia's accounting is a focus of US SEC investigation",
+            source="Reuters", guid="g_sec_log",
+        )
+        p_cfg = load_pipeline_config()
+        clf = GeminiEventClassifier(p_cfg, api_key="fake", transport=lambda _p: _valid_event_json())
+        pipe = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf)
+        with (
+            mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[art]),
+            mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=pipe),
+        ):
+            rss_scorer.check_once(cfg, {"seen_guids": []}, str(tmp_path / "vote.json"), now=_FIXED_NOW)
+        out = capsys.readouterr().out
+        assert out.index("[v2 live]") < out.index("    L4 ")
+        lines = [ln for ln in out.splitlines() if ln.startswith("    L4 ")]
+        assert len(lines) == 1
+        assert "VOTE_BEARISH" in lines[0] and "M5" in lines[0] and "T1" in lines[0]
+        assert "BEARISH" in lines[0] and "Nvidia" in lines[0]
+
+    def test_l2_duplicate_raw_record_keeps_similarity_and_match(self, tmp_path):
+        log_path = tmp_path / "news" / "news_log.jsonl"
+        cfg = _v2_live_cfg(tmp_path)
+        cfg["news_log_path"] = str(log_path)
+        title = "Exclusive-Nvidia's accounting is a focus of US SEC investigation"
+        articles = [
+            _art(title, source="Reuters", guid="g_sec_1", link="https://www.reuters.com/nvda-1"),
+            _art(title, source="Bloomberg", guid="g_sec_2", link="https://www.bloomberg.com/nvda-2"),
+        ]
+        p_cfg = load_pipeline_config()
+        clf = GeminiEventClassifier(p_cfg, api_key="fake", transport=lambda _p: _valid_event_json())
+        pipe = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf)
+        with (
+            mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=articles),
+            mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=pipe),
+        ):
+            state = rss_scorer.check_once(cfg, {"seen_guids": []}, str(tmp_path / "vote.json"), now=_FIXED_NOW)
+        sample = state["pipeline_v2_last_stats"]["l2_duplicate_samples"][0]
+        assert sample["similarity"] == 1.0 and sample["cluster_id"]
+        assert sample["representative_title"].startswith("Nvidia's accounting")
+        raw_path = Path(rss_news_log.default_raw_path(str(log_path)))
+        rows = [json.loads(line) for line in Path(rss_news_log.log_files(str(raw_path))[0]).read_text(encoding="utf-8").splitlines()]
+        dup = next(r for r in rows if r["pipeline_stage"] == "l2_duplicate")
+        assert dup["similarity"] == 1.0
+        assert dup["cluster_id"] == sample["cluster_id"]
+        assert dup["representative_title"].startswith("Nvidia's accounting")
+        assert dup["dup_method"]
+
+    def test_v2_pending_tracks_this_session_and_resets(self, tmp_path):
+        thu = datetime(2026, 11, 19, 21, 30, tzinfo=_TZ_TPE)
+        fri = datetime(2026, 11, 20, 21, 30, tzinfo=_TZ_TPE)
+        cfg = _v2_live_cfg(tmp_path)
+        art = _art(
+            "Fed Chair Warsh hikes rates 25 bps as 10-year Treasury yield tops 5.0%",
+            source="Bloomberg Markets", guid="g_fed",
+        )
+        p_cfg = load_pipeline_config()
+        clf = GeminiEventClassifier(
+            p_cfg, api_key="fake",
+            transport=lambda _p: _valid_event_json(
+                direction="BULLISH", category="MACRO_RATES",
+                summary_one_line="Fed signals a pause.",
+            ),
+        )
+        pipe = NewsSignalPipeline(p_cfg, embedder=LexicalFallbackEmbedder(64), classifier=clf)
+        vote = str(tmp_path / "vote.json")
+        with (
+            mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[art]),
+            mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=pipe),
+        ):
+            state = rss_scorer.check_once(cfg, {"seen_guids": []}, vote, now=thu)
+        assert len(state["v2_pending"]) == 1
+        row = state["v2_pending"][0]
+        assert row["M"] == 5 and row["T"] == 1 and row["direction"] == "BULLISH"
+        assert row["reason"].startswith("bullish_unconfirmed:")
+        assert "Fed Chair" in row["title"] and row["at"].startswith("2026-11-19T21:30")
+        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
+            state = rss_scorer.check_once(cfg, state, vote, now=thu + timedelta(minutes=30))
+        assert len(state["v2_pending"]) == 1
+        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
+            state = rss_scorer.check_once(cfg, state, vote, now=fri)
+        assert state["v2_pending"] == []
 
     def test_v2_live_zero_new_articles_still_decays_and_withdraws_vote(self, tmp_path):
         vote_base = tmp_path / "regime_vote.json"

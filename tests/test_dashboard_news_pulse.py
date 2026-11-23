@@ -7,11 +7,16 @@ number that fires the vote is worse than no page.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
+import re
+import shutil
+import subprocess
 import threading
 import urllib.request
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -139,6 +144,53 @@ def test_w3_state_from_an_earlier_session_reads_as_zero_tonight():
 
 def test_w3_state_missing_file():
     assert news_pulse.w3_state(None, NOW, SESSION, 1.5) == {"known": False}
+
+
+def test_w3_state_exposes_pending_for_the_current_session_only(tmp_path):
+    row = {"M": 5, "T": 1, "direction": "BULLISH",
+           "reason": "bullish_unconfirmed:no_fresh_confirm_quotes",
+           "title": "Fed pause", "at": "2026-08-04T20:00:00+08:00"}
+    st = news_pulse.w3_state(
+        {"session_key": SESSION, "session_net": 0, "v2_pending": [row, "nope"]},
+        NOW, SESSION, 1.5)
+    assert st["v2_pending"] == [row]
+    assert "v2_pending" not in inspect.getsource(news_feed.normalize)
+    old = news_pulse.w3_state(
+        {"session_key": "2026-08-03|NIGHT", "session_net": 0, "v2_pending": [row]},
+        NOW, SESSION, 1.5)
+    assert old["v2_pending"] == []
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    (bridge / "rss_scorer_state.json").write_text(
+        json.dumps({"session_key": SESSION, "session_net": 0, "v2_pending": [row]}),
+        encoding="utf-8")
+    out = news_pulse.pulse(NOW, None, {
+        "rss_state_file": str(bridge / "rss_scorer_state.json"),
+        "regime_vote_path": str(bridge / "regime_vote.json"),
+        "signal_path": str(bridge / "signal.json"),
+        "events_path": "",
+    }, _reader)
+    assert out["w3"]["v2_pending"] == [row]
+
+
+def test_pending_chip_replaces_the_neutral_zero():
+    html = Path(news_pulse.__file__).resolve().parent.joinpath("static", "index.html").read_text(encoding="utf-8")
+    body = re.search(r"function w3PendingLabel\(pending\) \{([\s\S]*?)\n\}", html)
+    assert body, "w3PendingLabel not found"
+    assert "pendingLabel && !w.direction && !net" in html
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node unavailable — cannot execute the pending chip label")
+    prog = (f"function w3PendingLabel(pending) {{{body.group(1)}\n}}\n"
+            "const one = [{reason: 'bullish_unconfirmed:regional_contradiction_^KS11 (-3.51%)'}];\n"
+            "const two = one.concat([{reason: 'other'}]);\n"
+            "console.log(JSON.stringify([w3PendingLabel([]), w3PendingLabel(one), w3PendingLabel(two)]));\n")
+    run = subprocess.run([node, "-e", prog], capture_output=True, text=True, encoding="utf-8", timeout=30)
+    assert run.returncode == 0, run.stderr
+    empty, one, two = json.loads(run.stdout)
+    assert empty == ""
+    assert one == "待市場確認 1 則 (bullish_unconfirmed:regional_contradiction_^KS11 (-3.51%))"
+    assert two.startswith("待市場確認 2 則 (")
 
 
 def _bridge(tmp_path):

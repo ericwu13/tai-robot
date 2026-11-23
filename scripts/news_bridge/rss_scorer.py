@@ -1559,6 +1559,7 @@ def _run_v2_live(
     """Run 4-layer pipeline v2 as the primary W3 scorer (``rss_pipeline_v2: live``)."""
     _ensure_repo_on_path()
     from src.news.pipeline import (  # noqa: PLC0415
+        ACTION_PENDING_MARKET_CONFIRM,
         SignalRouter,
         load_market_snapshot,
         load_pipeline_config,
@@ -1566,6 +1567,8 @@ def _run_v2_live(
     )
 
     mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
+    if state.get("session_key") != session_key:
+        state["v2_pending"] = []
     # v1's session EMA (±1.5, 2h) and v2's (+1.0/-0.85, 10h, 0.45 hysteresis)
     # are different scales. Read the previous mode before this pass stamps
     # it: only an already-live pass keeps session_net.
@@ -1689,6 +1692,8 @@ def _run_v2_live(
                 drop_reason=item.get("drop_reason", ""),
                 cluster_id=item.get("cluster_id", ""),
                 dup_method=item.get("dup_method", ""),
+                similarity=item.get("similarity"),
+                representative_title=item.get("representative_title", ""),
                 v2_action=item.get("v2_action", ""),
                 v2_category=item.get("v2_category", ""),
                 v2_direction=item.get("v2_direction", ""),
@@ -1709,6 +1714,16 @@ def _run_v2_live(
         f"| run={net:+.2f}, session={cum:+.2f} -> vote: {direction or 'none'} "
         f"| {emb_note} ({report.elapsed_ms:.0f}ms)"
     )
+    pending = state.get("v2_pending") if isinstance(state.get("v2_pending"), list) else []
+    stamp = now.isoformat(timespec="seconds")
+    for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
+        title = str(dec.article.get("title") or "").replace("\n", " ")
+        print(f"    L4 {rsig.action} M{ev.materiality} T{ev.source_tier} "
+              f"{ev.direction} {rsig.reject_reason} {title[:80]}")
+        if rsig.action == ACTION_PENDING_MARKET_CONFIRM:
+            pending.append({"M": ev.materiality, "T": ev.source_tier, "direction": ev.direction,
+                            "reason": rsig.reject_reason, "title": title[:120], "at": stamp})
+    state["v2_pending"] = pending
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
 
@@ -1874,18 +1889,22 @@ def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
     whose Gemini scoring failed (error_streak went up) is a failed run
     even though the process itself carries on.
 
-    ``now`` is passed to ``check_once`` (tests pin the clock; the weekend
-    pause would otherwise skip the pass on Sat/Sun)."""
+    ``now`` is computed once and passed to ``check_once`` (tests pin the
+    clock; the weekend pause would otherwise skip the pass on Sat/Sun)."""
+    now = now or datetime.now(_TZ_TAIPEI)
     with _run_recorder(Path(state_path).parent, "W3") as run:
         before = int(state.get("error_streak") or 0)
         run_cfg = dict(cfg, state_file=state_path)
         state = check_once(run_cfg, state, vote_out, now=now)
         save_state(state_path, state)
         run.exit_code = 0
-        run.result = (f"fetched {state.get('last_fetched', '-')} | "
-                      f"new {state.get('last_new', '-')} | "
-                      f"scored {state.get('last_articles_scored', 0)} | "
-                      f"net {float(state.get('session_net') or 0):+.2f}")
+        if in_weekend_pause(now):
+            run.result = "weekend pause (Sat 05:00–Mon 05:00 TPE): scoring skipped"
+        else:
+            run.result = (f"fetched {state.get('last_fetched', '-')} | "
+                          f"new {state.get('last_new', '-')} | "
+                          f"scored {state.get('last_articles_scored', 0)} | "
+                          f"net {float(state.get('session_net') or 0):+.2f}")
         if state.get("fetch_status") == "failed":
             n_fail = int(state.get("feeds_failed") or 0)
             brief = _feed_error_brief(state.get("last_feed_errors"))

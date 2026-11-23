@@ -103,6 +103,8 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
     key = str(state.get("session_key") or "")
     current = bool(key) and key == tonight_session
     net = _num(state.get("session_net")) if current else 0.0
+    raw_pending = state.get("v2_pending") if current else []
+    v2_pending = [p for p in raw_pending if isinstance(p, dict)] if isinstance(raw_pending, list) else []
     peak = _num(state.get("session_peak")) if current else 0.0
     recent = [_num(x) for x in (state.get("recent_runs") or [])
               if isinstance(x, (int, float))] if current else []
@@ -141,6 +143,7 @@ def w3_state(state: dict | None, now: datetime, tonight_session: str,
         "session": key,
         "current": current,
         "session_net": round(net, 3),
+        "v2_pending": v2_pending,
         "session_peak": round(peak, 3),
         "to_threshold": round(eff_threshold - abs(net), 3),
         "direction": direction,

@@ -435,6 +435,8 @@ def backfill_batches(
                         drop_reason=item.get("drop_reason", ""),
                         cluster_id=item.get("cluster_id", ""),
                         dup_method=item.get("dup_method", ""),
+                        similarity=item.get("similarity"),
+                        representative_title=item.get("representative_title", ""),
                         v2_action=item.get("v2_action", ""),
                         v2_category=item.get("v2_category", ""),
                         v2_direction=item.get("v2_direction", ""),

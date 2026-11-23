@@ -134,6 +134,7 @@ class PipelineRunReport:
             "bullish_vote_threshold": self.bullish_vote_threshold,
             "vote_withdraw_threshold": self.vote_withdraw_threshold,
             "ema_half_life_hours": self.ema_half_life_hours,
+            "l2_duplicate_samples": self.l2_duplicate_samples,
         }
 
 
@@ -200,12 +201,14 @@ class NewsSignalPipeline:
         l2_dups = [d for d in dedup_decisions if d.is_duplicate]
         l2_tier_upgraded = [d for d in dedup_decisions if d.tier_upgraded]
         to_classify = [d for d in dedup_decisions if d.needs_llm]
+        rep_titles = {c.cluster_id: c.representative_title for c in self.clusterer.active}
         l2_dup_samples = [
             {
                 "title": d.prefilter.cleaned_title[:120],
                 "cluster_id": d.cluster_id,
                 "method": d.dup_method,
                 "similarity": d.similarity,
+                "representative_title": rep_titles.get(d.cluster_id, "")[:120],
                 "mention_count": d.mention_count,
             }
             for d in l2_dups[:20]
@@ -260,6 +263,7 @@ class NewsSignalPipeline:
             market=market,
             emit_risk_off_enabled=emit_risk_off_enabled,
             interval_minutes=interval_minutes,
+            now=now,
         )
 
         # Persist classification summary + routed latch back onto active clusters
@@ -301,6 +305,8 @@ class NewsSignalPipeline:
                         "source_tier": d.source_tier,
                         "cluster_id": d.cluster_id,
                         "dup_method": d.dup_method,
+                        "similarity": d.similarity,
+                        "representative_title": rep_titles.get(d.cluster_id, ""),
                     }
                 )
         for dec, err in l3_failed_items:

@@ -282,6 +282,7 @@ def test_all_200_empty_is_quiet(tmp_path, monkeypatch):
     assert state["fetch_error_streak"] == 0
     row = _runs(state_path)[-1]
     assert row["ok"] is True and row["exit_code"] == 0
+    assert "net" in row["result"] and "fetched" in row["result"]
 
 
 def test_nothing_recent_is_quiet_not_failed(tmp_path, monkeypatch):
@@ -428,6 +429,27 @@ def test_parser_fixtures_taifex_yahoo_cnyes(monkeypatch):
 
 
 # ── 9. urllib timeout and the existing User-Agent ────────────────────────
+
+def test_weekend_pause_run_row_drops_stale_counts(tmp_path):
+    """The pause returns before last_* is refreshed. The run row must not
+    reuse Friday's fetched count or session net."""
+    saturday = datetime(2026, 11, 14, 12, 0, tzinfo=_TPE)
+    cfg, state_path = _cfg(tmp_path, ["https://a.example/rss"])
+    seeded = {
+        "seen_guids": ["keep-me"],
+        "session_net": 1.25,
+        "last_fetched": 40,
+        "last_new": 7,
+        "last_articles_scored": 3,
+        "session_key": "2026-11-13|NIGHT",
+    }
+    rss_scorer._recorded_pass(cfg, dict(seeded), "", state_path, now=saturday)
+    row = _runs(state_path)[-1]
+    assert row["ok"] is True and row["exit_code"] == 0
+    assert row["result"] == "weekend pause (Sat 05:00–Mon 05:00 TPE): scoring skipped"
+    assert "fetched" not in row["result"] and "net" not in row["result"]
+    assert "1.25" not in row["result"] and "40" not in row["result"]
+
 
 def test_weekend_pause_does_not_carry_a_failed_fetch(tmp_path):
     """Saturday does not fetch. Friday's all-feeds-failed state must not

@@ -829,6 +829,11 @@ const sentiInv = (y, on) => (on ? Math.sign(y) * Math.expm1(Math.abs(y)) : y);
 function signedSpan(v, digits = 2) {
   return el("span", { class: v > 0 ? "up" : v < 0 ? "down" : "muted" }, signedText(v, digits));
 }
+function w3PendingLabel(pending) {
+  if (!pending || !pending.length) return "";
+  const reason = (pending[0] && pending[0].reason) || "";
+  return `待市場確認 ${pending.length} 則 (${reason})`;
+}
 // Remembered per browser so "新" marks articles scored since the last visit.
 const NEWS_SEEN_KEY = "newsSeenScoredAt";
 function readSeen() { try { return localStorage.getItem(NEWS_SEEN_KEY) || ""; } catch (e) { return ""; } }
@@ -1347,6 +1352,7 @@ const App = {
     // Gauge: the decision is a threshold crossing, so show the margin to it.
     const net = w.known ? w.session_net : 0;
     const peak = w.known ? w.session_peak : 0;
+    const pendingLabel = w3PendingLabel(w.v2_pending);
     const span = Math.max(T * 2, Math.abs(net) * 1.15, Math.abs(peak) * 1.15);
     const pos = (v) => `${50 + (v / span) * 50}%`;
     const fill = el("div", { class: "fill" });
@@ -1362,10 +1368,13 @@ const App = {
     else if (p.weekend_pause) state = el("span", { class: "chip s-off" }, "週末暫停評分");
     else if (w.direction) state = el("span", { class: "rg " + (w.direction === "trending-up" ? "up" : "down") },
       w.direction === "trending-up" ? "已達門檻・偏多投票" : "已達門檻・偏空投票");
+    else if (pendingLabel && net) state = el("span", { class: "chip s-off" }, pendingLabel);
     else state = el("span", { class: "muted" }, `中性・距門檻 ${Math.max(0, w.to_threshold).toFixed(2)}`);
+    const numEl = (pendingLabel && !w.direction && !net)
+      ? el("span", { class: "chip s-off" }, pendingLabel) : signedSpan(net);
     $("n-gauge").replaceChildren(
       el("div", { class: "sub" }, `W3 新聞情緒・${sessionKey(p.session)}` + (w.known && !w.current ? "（今晚尚未評分）" : "")),
-      el("div", { class: "num" }, signedSpan(net)),
+      el("div", { class: "num" }, numEl),
       el("div", { class: "state" }, state,
         w.eroding ? el("span", { class: "pend" }, `回落：峰值 ${signedText(peak)}`) : null),
       bar,
