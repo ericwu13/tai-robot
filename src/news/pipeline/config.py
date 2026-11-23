@@ -104,7 +104,7 @@ class RouterConfig:
     market_snapshot_max_age_s: int = 1800
     tier3_can_trigger_vote: bool = False
     bearish_vote_threshold: float = 0.85
-    bullish_vote_threshold: float = 1.0
+    bullish_vote_threshold: float = 0.85
     vote_withdraw_threshold: float = 0.45
     ema_half_life_hours: float = 10.0
     emit_risk_off_min_materiality: int = 4
@@ -213,7 +213,7 @@ def _build_config(raw: dict[str, Any], source_path: str) -> PipelineConfig:
             market_snapshot_max_age_s=int(rt.get("market_snapshot_max_age_s", 1800)),
             tier3_can_trigger_vote=bool(rt.get("tier3_can_trigger_vote", False)),
             bearish_vote_threshold=float(rt.get("bearish_vote_threshold", 0.85)),
-            bullish_vote_threshold=float(rt.get("bullish_vote_threshold", 1.0)),
+            bullish_vote_threshold=float(rt.get("bullish_vote_threshold", 0.85)),
             vote_withdraw_threshold=float(rt.get("vote_withdraw_threshold", 0.45)),
             ema_half_life_hours=float(rt.get("ema_half_life_hours", 10.0)),
             emit_risk_off_min_materiality=int(rt.get("emit_risk_off_min_materiality", 4)),

@@ -59,6 +59,7 @@ from src.news.pipeline import (  # noqa: E402
     NewsSignalPipeline,
     PreFilterResult,
     PriorEventContext,
+    RouterConfig,
     SignalRouter,
     build_classification_prompt,
     clean_title,
@@ -625,6 +626,18 @@ class TestLayer4Router:
         assert two.weighted_score == pytest.approx(0.5667)
         assert four.weighted_score == pytest.approx(0.85)
 
+    def test_bull_vote_fires_at_0_85(self):
+        assert RouterConfig().bullish_vote_threshold == pytest.approx(0.85)
+        assert self.cfg.router.bullish_vote_threshold == pytest.approx(0.85)
+        assert self.router.resolve_vote_direction(0.85) == "trending-up"
+        assert self.router.resolve_vote_direction(0.8499) is None
+        ev = self._ev(direction="BULLISH", materiality=5, source_tier=2, event_id="bull_line")
+        voted = self.router.route_batch(
+            [ev], prev_session_net=0.0, outlets_by_event={"bull_line": 4},
+        )
+        assert voted.session_net == pytest.approx(0.85)
+        assert voted.vote_direction == "trending-up"
+
 
 class TestOutletBreadth:
     def test_outlet_key_rules_and_legacy_round_trip(self):
@@ -736,7 +749,7 @@ class TestOutletBreadth:
 
 # ── Phase 4/5 Integration: rss_scorer Feature Flag & Dashboard Parity ────
 
-# 1.2 sits under v1's ±1.5 vote line and over v2's +1.0 line. Carrying that
+# 1.2 sits under v1's ±1.5 vote line and over v2's +0.85 line. Carrying that
 # v1 EMA into the first live pass emits trending-up; 0.45 hysteresis can
 # then hold the unconfirmed vote through the 04:58 classify.
 _V1_CARRY_NET = 1.2
@@ -1051,7 +1064,7 @@ class TestRssScorerV2Integration:
             "v2_active_vote": "trending-down",
             "pipeline_v2_last_stats": {
                 "bearish_vote_threshold": 0.85,
-                "bullish_vote_threshold": 1.0,
+                "bullish_vote_threshold": 0.85,
                 "vote_withdraw_threshold": 0.45,
             },
         }
@@ -1069,6 +1082,12 @@ class TestRssScorerV2Integration:
         st_v1 = news_pulse.w3_state(v1_state, _FIXED_NOW, session_key, threshold=1.5)
         assert st_v1["direction"] == ""
         assert st_v1["to_threshold"] == 0.6
+
+        # No stored bull line: the dashboard fallback matches the 0.85 vote.
+        bare = {"session_key": session_key, "session_net": 0.85, "pipeline_v2_mode": "live"}
+        st_bull = news_pulse.w3_state(bare, _FIXED_NOW, session_key, threshold=1.5)
+        assert st_bull["direction"] == "trending-up"
+        assert st_bull["to_threshold"] == 0.0
 
     def test_api_error_rolls_back_unclassified_cluster_for_retry(self, tmp_path):
         p_cfg = load_pipeline_config()

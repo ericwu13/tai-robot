@@ -49,7 +49,7 @@ affecting votes/signals:
   release gate, source-tier authority (Tier 3 alone cannot trigger votes),
   asymmetric directional gates (BEARISH `materiality >= 4`, threshold `-0.85`;
   BULLISH `materiality == 5` + fresh W2/SKCOM confirmation with regional
-  contradiction checks, threshold `+1.0`), and 10h EMA + `0.45` withdrawal
+  contradiction checks, threshold `+0.85`), and 10h EMA + `0.45` withdrawal
   hysteresis (including decay/withdrawal on 0-article runs). Opt-in
   `news.rss_emit_risk_off: true` allows Tier 1/2 M4+ market-confirmed bearish
   shocks to write `signal.json` (`severity: "high"`).

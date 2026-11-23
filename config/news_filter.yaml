@@ -185,7 +185,7 @@ classifier:
 router:
   # First sighting is this fraction of full weight; full weight at this many outlets.
   # Bull and bear share classifier.min_materiality_pass. risk_off still reads
-  # bullish_confirm_symbols. bullish_vote_threshold stays 1.0 (replay used 0.85).
+  # bullish_confirm_symbols. bullish_vote_threshold matches bearish at 0.85.
   first_sighting_weight: 0.5
   full_weight_outlets: 4
   bullish_confirm_symbols:
@@ -197,7 +197,7 @@ router:
   market_snapshot_max_age_s: 1800
   tier3_can_trigger_vote: false
   bearish_vote_threshold: 0.85
-  bullish_vote_threshold: 1.0
+  bullish_vote_threshold: 0.85
   # A standing vote holds until session_net fades inside ±vote_withdraw_threshold.
   # One outlet no longer reaches the entry line by itself.
   vote_withdraw_threshold: 0.45

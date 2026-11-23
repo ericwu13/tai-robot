@@ -57,7 +57,7 @@ RSS Fetch (13 default feeds)
    • 來源權威：Tier 3 單獨不可觸發投票或斷路器（僅 ADVISORY_LOW_TIER）
    • 非對稱多空門檻：
      - BEARISH：materiality >= 4（Tier 1/2）立即放行防禦投票（門檻 -0.85）
-     - BULLISH：materiality == 5 且通過 W2/SKCOM 量價確認（含 asof ≤ 1800s 新鮮度檢查與 ^HSI/^N225/^KS11/ASML.AS 區域矛盾檢查，門檻 +1.00）
+     - BULLISH：materiality == 5 且通過 W2/SKCOM 量價確認（含 asof ≤ 1800s 新鮮度檢查與 ^HSI/^N225/^KS11/ASML.AS 區域矛盾檢查，門檻 +0.85）
    • 遲滯與衰減（Hysteresis）：10h EMA 半衰期 + 0.45 撤票下限，確保單一去重催化事件可存活至 ~04:58 TPE 夜盤分類；無新文章時亦照常衰減並在跌破下限時撤票
    • 預設僅輸出 `regime_vote_w3.json`；opt-in `news.rss_emit_risk_off: true` 時寫入 `severity: "high"` 之 `signal.json`（保留 `conflicting_leg` 不誤砍獲利空單之特性）
 ```
@@ -70,7 +70,7 @@ RSS Fetch (13 default feeds)
 
 1. **[P0] 單一去重催化事件過早自毀（EMA 2h → 10h + 0.45 撤票遲滯）**：`RegimeSwitchingRunner` 每日僅於 ~04:58 TPE 讀取一次 `regime_vote_w3.json`，而 v2 去重使單一衝擊在 4–48h 內僅計分一次。原 2h 半衰期會使 T2 M4 衝擊在 1 小時內自刪；改為 `ema_half_life_hours: 10.0` + `vote_withdraw_threshold: 0.45` 後，T2 M4 可穩定存活 ~9.2h、T1 M5 ~14.7h，且於 `guid_new == []` 靜默輪次仍正常衰減撤票，杜絕殭屍票。
 2. **[P0] 狀態檔膨脹隔離（旁車檔 `rss_pipeline_v2_state.json`）**：壓測顯示滿載 400 active + 600 archived 之 256-dim 群組 JSON 約 ~2.0 MB；抽離至旁車檔並對歸檔群組採用精簡格式與 3 位小數向量後，`rss_scorer_state.json` 維持精簡，不影響 Dashboard / GUI / `check_bridge` 輪詢。
-3. **[P0] Dashboard 門檻同步（`scripts/dashboard/news_pulse.py`）**：當 `pipeline_v2_mode == "live"` 時，儀表板自動改用 v2 非對稱門檻（`-0.85` / `+1.00`）與 `v2_active_vote` 遲滯狀態，避免 `-0.90` 已投票卻在畫面顯示「中性・距門檻 0.60」；`off` / `shadow` 模式行為 100% 不變。
+3. **[P0] Dashboard 門檻同步（`scripts/dashboard/news_pulse.py`）**：當 `pipeline_v2_mode == "live"` 時，儀表板自動改用 v2 非對稱門檻（`-0.85` / `+0.85`）與 `v2_active_vote` 遲滯狀態，避免 `-0.90` 已投票卻在畫面顯示「中性・距門檻 0.60」；`off` / `shadow` 模式行為 100% 不變。
 4. **[P1] W2 報價 `asof` 新鮮度與區域股指矛盾檢查**：`load_market_snapshot` 驗證 `crossmarket_quotes.json` 之 `asof` 年齡（上限 `1800s`），並新增 `bullish_contra_symbols`（`^N225`、`^KS11`、`^HSI`、`ASML.AS`，跌幅 `<= -1.5%` 即擋下多頭確認）。
 5. **[P1] Layer 1 白名單與純漲跌校正**：自 `causal_protection_whitelist` 移除裸 `\bIPO\b`（防止 Anthropic IPO 行情稿繞過攔截），增補 `台積電ADR\d+日(上漲|下跌)` 與台股純報漲跌模板，並補齊 BIS 遠端算力封鎖、美國非農就業、關稅、台幣匯率、BOJ、Neocloud 等核心關鍵字。
 6. **[P1] Shadow 模式可觀測性**：`[v2 shadow]` 輸出 `emb=`、`fb=`、`schema_fail=`、`err=` 至標準輸出日誌，並將 API／Embedding 降級訊息寫入 `pipeline_v2_shadow_error`。

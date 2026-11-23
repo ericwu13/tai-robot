@@ -96,7 +96,7 @@ class PipelineRunReport:
     safe_seen_guids: list[str] = field(default_factory=list)
     raw_outcomes: list[dict[str, Any]] = field(default_factory=list)
     bearish_vote_threshold: float = 0.85
-    bullish_vote_threshold: float = 1.0
+    bullish_vote_threshold: float = 0.85
     vote_withdraw_threshold: float = 0.45
     ema_half_life_hours: float = 10.0
     reweight_delta: float = 0.0

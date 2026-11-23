@@ -84,7 +84,7 @@ def _v2_thresholds(state: dict) -> tuple[float, float]:
     stats = state.get("pipeline_v2_last_stats")
     stats = stats if isinstance(stats, dict) else {}
     bear = _num(stats.get("bearish_vote_threshold"), 0.85) or 0.85
-    bull = _num(stats.get("bullish_vote_threshold"), 1.0) or 1.0
+    bull = _num(stats.get("bullish_vote_threshold"), 0.85) or 0.85
     return bear, bull
 
 
