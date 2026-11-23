@@ -865,28 +865,37 @@ def test_hold_across_close_keeps_the_closed_gap_lead(monkeypatch):
     assert fake.calls.count("EnterMonitorLONG") == enters
 
 
-def test_last_minute_across_close_still_holds_until_the_open(monkeypatch):
-    """#157 is not folded into the lead.
+@pytest.mark.parametrize(
+    "drop,open_at",
+    [
+        (tpe(2026, 11, 12, 7, 30), tpe(2026, 11, 12, 8, 45)),
+        (tpe(2026, 11, 12, 14, 0), tpe(2026, 11, 12, 15, 0)),
+    ],
+)
+def test_last_minute_catchup_tick_waits_for_the_open(monkeypatch, drop, open_at):
+    """A tick that skips [lead, open−1min) still waits until the open.
 
-    A lead set at 07:30 stays at 08:30 through 08:00. Inside the last
-    minute the across-close pass still holds EnterMonitor until 08:45.
+    #157 is applied before the lead. 08:44:30 and 14:59:30 call no
+    EnterMonitorLONG. The open tick does.
     """
-    drop = tpe(2026, 11, 12, 7, 30)
-    open_at = tpe(2026, 11, 12, 8, 45)
     lead = _closed_gap_lead(open_at)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
     _running(app)
+    enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fake.force_quote_state = 0
     _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
     machine = app._link_host.machine
     assert machine._quote_enter_not_before == lead
+    assert fake.calls.count("EnterMonitorLONG") == enters
     late = open_at - timedelta(seconds=30)
-    clock["now"] = late
-    fake.set_now(late)
-    app._hold_quote_down_across_close(late)
+    _tick(app, fake, clock, late)
+    assert fake.calls.count("EnterMonitorLONG") == enters
+    assert machine.quote == LinkPhase.DOWN
     assert machine._quote_enter_not_before == open_at
-    assert (open_at - late) <= timedelta(minutes=1)
+    _tick(app, fake, clock, open_at)
+    assert fake.calls.count("EnterMonitorLONG") == enters + 1
+    assert machine.quote == LinkPhase.CONNECTING
 
 
 def test_open_session_timeout_enters_after_five_second_settle(monkeypatch):
