@@ -270,7 +270,6 @@ class BackfillResult:
     l4_passed: int = 0
     votes_up: int = 0
     votes_down: int = 0
-    bullish_unconfirmed: int = 0
     cache_hits: int = 0
     api_calls: int = 0
     api_errors: list[str] = field(default_factory=list)
@@ -379,10 +378,6 @@ def backfill_batches(
 
         if report.api_error:
             res.api_errors.append(f"{batch_dt.isoformat(timespec='seconds')}: {report.api_error}")
-
-        for rsig in report.routing.routed_signals:
-            if rsig.reject_reason.startswith("bullish_unconfirmed:"):
-                res.bullish_unconfirmed += 1
 
         run_net = report.routing.run_net
         session_net = report.routing.session_net
@@ -594,7 +589,7 @@ def format_summary(res: BackfillResult, *, dry_run: bool) -> str:
         lines.extend(
             [
                 f"Layer 3 succeeded   : {res.l3_succeeded:,}/{res.l3_attempted:,} (schema failures: {res.l3_schema_failures})",
-                f"Layer 4 passed      : {res.l4_passed:,} (bullish unconfirmed held: {res.bullish_unconfirmed})",
+                f"Layer 4 passed      : {res.l4_passed:,}",
                 f"Batch votes         : up={res.votes_up}, down={res.votes_down}",
                 f"Gemini API calls    : {res.api_calls:,} (cache hits: {res.cache_hits:,})",
                 f"Output JSONL rows   : {total_rows:,} across {len(res.records_by_month)} month(s)",

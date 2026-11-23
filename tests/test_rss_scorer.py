@@ -1109,3 +1109,6 @@ def test_l4_log_weekend_row_and_matched_title(tmp_path, capsys):
     row = json.loads((state_path.parent / "runs" / "W3.jsonl").read_text(encoding="utf-8").splitlines()[-1])
     assert row["result"] == "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
     assert "1.25" not in row["result"] and "fetched" not in row["result"]
+    log_line = rss_scorer._loop_log_line(saturday, {"last_articles_scored": 7, "last_net_score": 1.25})
+    assert log_line.endswith("weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped")
+    assert "1.25" not in log_line and "scored" not in log_line

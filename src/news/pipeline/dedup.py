@@ -312,16 +312,17 @@ class PriorEventContext:
 
 
 def outlet_key(article: dict) -> str:
-    """Publisher after the last `` - `` in the raw title, else ``source``.
+    """Replay outlet: `` - ([^-]+)$`` on the raw title, otherwise ``source``.
 
-    A trailing ``- 最新新聞`` is stripped. Capped at ``_MAX_CLUSTER_URLS``.
+    A trailing ``最新新聞`` mark on that piece is removed. The cluster's
+    outlet list, not this string, is what ``_MAX_CLUSTER_URLS`` caps.
     """
-    raw = str((article or {}).get("title") or "")
-    key = raw.rsplit(" - ", 1)[-1] if " - " in raw else str((article or {}).get("source") or "")
-    suffix = "- 最新新聞"
-    if key.endswith(suffix):
-        key = key[: -len(suffix)]
-    return key.strip().lower()
+    title = str((article or {}).get("title") or "")
+    source = str((article or {}).get("source") or "")
+    m = re.search(r" - ([^-]+)$", title or "")
+    s = (m.group(1) if m else source or "").strip()
+    s = re.sub(r"\s*-\s*最新新聞$", "", s)
+    return s.lower()
 
 
 def _outlets_from(raw: dict) -> list[str]:
@@ -783,7 +784,7 @@ class IncrementalEventClusterer:
                 simhashes=[sh] if sh else [],
                 canonical_urls=[pf.canonical_url] if pf.canonical_url else [],
                 norm_keys=[nkey] if nkey else [],
-                outlets=[outlet_key(art)] if outlet_key(art) else [],
+                outlets=[key] if (key := outlet_key(art)) else [],
             )
             self.active.append(cluster)
             if len(self.active) > self._cfg.max_active_clusters:

@@ -1871,16 +1871,24 @@ def main() -> int:
         interval = cfg["interval_minutes"] * 60
         print(f"looping every {cfg['interval_minutes']}m")
         while True:
-            state = _recorded_pass(cfg, state, vote_out, state_path)
-            append_log(log_dir / LOG_NAME,
-                       f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
-                       f"scored {state.get('last_articles_scored', 0)} | "
-                       f"net {state.get('last_net_score', 0):+.2f}")
+            now = datetime.now(_TZ_TAIPEI)
+            state = _recorded_pass(cfg, state, vote_out, state_path, now=now)
+            append_log(log_dir / LOG_NAME, _loop_log_line(now, state))
             time.sleep(interval)
     else:
         state = _recorded_pass(cfg, state, vote_out, state_path)
 
     return 0
+
+
+def _loop_log_line(now: datetime, state: dict) -> str:
+    """One rss_scorer.log line. A pause must not reprint Friday's counts."""
+    if in_weekend_pause(now):
+        body = "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
+    else:
+        body = (f"scored {state.get('last_articles_scored', 0)} | "
+                f"net {state.get('last_net_score', 0):+.2f}")
+    return f"{now:%Y-%m-%d %H:%M:%S} TPE | {body}"
 
 
 def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,

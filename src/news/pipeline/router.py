@@ -207,7 +207,7 @@ class SignalRouter:
         self._min_mat_pass: int = config.classifier.min_materiality_pass
 
     def breadth_multiplier(self, outlets: int) -> float:
-        """cap at 1 outlet, 1.0 once distinct outlets reach full_weight_outlets."""
+        """first_sighting_weight at one outlet, 1.0 at full_weight_outlets."""
         cap = float(self._rt.first_sighting_weight)
         breadth = max(1, int(self._rt.full_weight_outlets))
         seen = max(1, int(outlets))

@@ -631,7 +631,18 @@ class TestOutletBreadth:
         from src.news.pipeline.dedup import EventCluster, outlet_key
         assert outlet_key({"title": "Ban lifted - Reuters"}) == "reuters"
         assert outlet_key({"title": "No separator here", "source": "Bloomberg Markets"}) == "bloomberg markets"
-        assert outlet_key({"title": "Story - Yahoo股市- 最新新聞"}) == "yahoo股市"
+        # The replay regex needs a hyphen-free tail. "Yahoo股市- 最新新聞" has a
+        # hyphen, so the title does not match and the source is used.
+        assert outlet_key({"title": "Story - Yahoo股市- 最新新聞", "source": "Yahoo股市 - 最新新聞"}) == "yahoo股市"
+        # Anue flash prefixes: ` - ([^-]+)$` captures the headline, not 鉅亨速報.
+        # The same headline from 鉅亨速報 and 盤中速報 is one outlet. A different
+        # headline is a different key (the headline itself).
+        same = "台積電法說會"
+        assert outlet_key({"title": f"鉅亨速報 - {same}", "source": "Anue鉅亨"}) == same
+        assert outlet_key({"title": f"盤中速報 - {same}", "source": "Anue鉅亨"}) == same
+        other = outlet_key({"title": "鉅亨速報 - 聯發科上修展望", "source": "Anue鉅亨"})
+        assert other == "聯發科上修展望"
+        assert other != same
         legacy = EventCluster.from_dict({
             "cluster_id": "legacy", "representative_source": "CNBC", "source_tier": 2,
         })
@@ -896,16 +907,12 @@ class TestRssScorerV2Integration:
             mock.patch.object(rss_scorer, "_build_v2_pipeline", return_value=pipe),
         ):
             state = rss_scorer.check_once(cfg, {"seen_guids": []}, str(tmp_path / "vote.json"), now=_FIXED_NOW)
-        sample = state["pipeline_v2_last_stats"]["l2_duplicate_samples"][0]
-        assert sample["similarity"] == 1.0 and sample["cluster_id"]
-        assert sample["representative_title"].startswith("Nvidia's accounting")
+        assert "l2_duplicate_samples" not in state["pipeline_v2_last_stats"]
         raw_path = Path(rss_news_log.default_raw_path(str(log_path)))
         rows = [json.loads(line) for line in Path(rss_news_log.log_files(str(raw_path))[0]).read_text(encoding="utf-8").splitlines()]
         dup = next(r for r in rows if r["pipeline_stage"] == "l2_duplicate")
-        assert dup["similarity"] == 1.0
-        assert dup["cluster_id"] == sample["cluster_id"]
+        assert dup["similarity"] == 1.0 and dup["cluster_id"]
         assert dup["matched_title"].startswith("Nvidia's accounting")
-        assert dup["similarity"] == sample["similarity"]
         assert dup["dup_method"]
 
     def test_v2_live_zero_new_articles_still_decays_and_withdraws_vote(self, tmp_path):
@@ -1254,6 +1261,9 @@ class TestRssScorerV2Integration:
         assert len(raw_backfill_rows) == 4  # ALL 4 raw articles preserved with L1/L2/L3 fate + v1 scores
         assert {r["pipeline_stage"] for r in raw_backfill_rows} == {"l1_dropped", "l2_duplicate", "l3_classified"}
         assert all("v1_direction" in r and "v1_score" in r for r in raw_backfill_rows)
+        backfill_dups = [r for r in raw_backfill_rows if r["pipeline_stage"] == "l2_duplicate"]
+        assert backfill_dups and backfill_dups[0]["similarity"] == 1.0
+        assert backfill_dups[0]["matched_title"]
         assert out["state_updated"] is True
         assert Path(out["sidecar_path"]).exists()
 

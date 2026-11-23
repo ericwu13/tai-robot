@@ -133,7 +133,6 @@ class PipelineRunReport:
             "bullish_vote_threshold": self.bullish_vote_threshold,
             "vote_withdraw_threshold": self.vote_withdraw_threshold,
             "ema_half_life_hours": self.ema_half_life_hours,
-            "l2_duplicate_samples": self.l2_duplicate_samples,
         }
 
 
@@ -253,6 +252,7 @@ class NewsSignalPipeline:
                 if not (c.cluster_id in drop_ids and not c.classified_category)
             ]
 
+        # Per-evidence decay; story age is not reset by later outlets.
         # Breadth deltas for clusters already routed; this run's new events are excluded.
         reweight_delta = 0.0
         fresh_ids = {d.cluster_id for d in to_classify}
