@@ -297,9 +297,11 @@ class LinkStateMachine:
 
         ``release_at`` is set only for an open-session mark-down. A
         fresh tick at or after that instant restores READY. A closed
-        gap passes the host's hold: the next open, or that open minus
-        the closed-gap lead when IsConnected()==0. None only when the
-        host has no next open. A tick before the hold cannot restore.
+        gap passes the host's hold: the next open, or max(now, that
+        open minus the closed-gap lead) when IsConnected()==0. The
+        last minute before the open is separate and still passes the
+        open. None only when the host has no next open. A tick before
+        the hold cannot restore.
         IsConnected() is not read here.
 
         Refuses unless the quote is READY. A CONNECTING or DOWN quote
@@ -316,7 +318,7 @@ class LinkStateMachine:
         self._quote_enter_not_before = enter_not_before
         # Open session passes release_at=now and no enter_not_before,
         # so the next fresh tick can restore. A closed gap passes the
-        # host's hold: the next open, or the open minus the lead.
+        # host's hold: the next open, or max(now, open minus the lead).
         # The anchor is the restore state. The other three fields are
         # the enter-hold and the stuck pause; clearing them must not
         # clear a due anchor, and a full end clears all four together.

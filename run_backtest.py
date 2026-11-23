@@ -2092,14 +2092,14 @@ class BacktestApp:
         no re-login, no process restart.
 
         During a closed session the quote is marked down. When
-        IsConnected()==0, EnterMonitorLONG waits until
-        ``CLOSED_GAP_ENTER_LEAD`` before the next open. Inside that
-        window the machine's 5s settle enters. It does not run in the
-        minute before that open (#157). When IsConnected() is anything
-        else, no SKCOM call is made during the gap. EnterMonitorLONG
-        waits until the open. The stuck timer does not run until the
-        next open, so the link does not go DEGRADED while the session
-        is closed.
+        IsConnected()==0, EnterMonitorLONG runs at
+        max(now, next open − ``CLOSED_GAP_ENTER_LEAD``). The minute
+        before that open is #157 and is unchanged: EnterMonitorLONG
+        waits until the open. When IsConnected() is anything else, no
+        SKCOM call is made during the gap. EnterMonitorLONG waits
+        until the open. The stuck timer does not run until the next
+        open, so the link does not go DEGRADED while the session is
+        closed.
 
         An open session with a subscribed runner stays READY when a
         fresh tick arrived in the last 30s. IsConnected() is not that
@@ -2113,7 +2113,8 @@ class BacktestApp:
         covers a closed gap when nothing is subscribed and
         IsConnected() is not 0: no mark-down and no further SKCOM call.
         IsConnected()==0 in that gap still starts the quote-down path.
-        EnterMonitorLONG waits until the closed-gap lead. The 3002 stays
+        EnterMonitorLONG runs at max(now, next open − the closed-gap
+        lead). The 3002 stays
         pending until Ready (3003), a disconnect, manual Reconnect, a
         fresh tick, or the next subscription's 15s window.
         """
@@ -2299,12 +2300,12 @@ class BacktestApp:
         is CONNECTING or DOWN: that is a #178 attempt already in
         progress, and this path must not clear its 3003 wait.
 
-        Closed session, IsConnected()==0: EnterMonitorLONG waits until
-        ``CLOSED_GAP_ENTER_LEAD`` before the next open. Inside that
-        window the machine's 5s settle enters. The stuck clock still
-        waits until the next open. Closed session, IsConnected()
-        anything else, or the minute before the open: EnterMonitorLONG
-        waits until that open, and the gap makes no further SKCOM call.
+        Closed session, IsConnected()==0: EnterMonitorLONG runs at
+        max(now, next open − ``CLOSED_GAP_ENTER_LEAD``). The stuck
+        clock still waits until the next open. The minute before the
+        open is #157 and is not part of that max: EnterMonitorLONG
+        waits until the open, and the gap makes no further SKCOM call
+        for any other IsConnected reading, including a probe error.
         Open session: the same 5s settle, then EnterMonitorLONG only
         if IsConnected()==0.
         """
@@ -2405,12 +2406,11 @@ class BacktestApp:
     def _closed_gap_enter_hold(self, now, nxt):
         """When EnterMonitorLONG may run during a closed session.
 
-        IsConnected()==0 returns ``nxt`` minus ``CLOSED_GAP_ENTER_LEAD``.
-        Inside that window the instant is already due, so the machine's
-        5s settle enters. The minute before the open still waits (#157).
-        Any other reading, including a probe error, waits for the open
-        and the gap makes no further SKCOM call. ``nxt`` None returns
-        None. The read is the broker port.
+        IsConnected()==0 returns max(now, ``nxt`` − ``CLOSED_GAP_ENTER_LEAD``).
+        The minute before the open is #157 and is not folded into that
+        max: it still returns ``nxt``. Any other reading, including a
+        probe error, waits for the open and the gap makes no further
+        SKCOM call. ``nxt`` None returns None. The read is the broker port.
         """
         if nxt is None:
             return None
@@ -2430,7 +2430,7 @@ class BacktestApp:
             )
             return nxt
         if state == 0:
-            return nxt - self.CLOSED_GAP_ENTER_LEAD
+            return max(now, nxt - self.CLOSED_GAP_ENTER_LEAD)
         return nxt
 
     def _quote_down_if_resubscribe_disconnected(self, code) -> None:
@@ -2688,9 +2688,9 @@ class BacktestApp:
         Only ``note_quote_not_ready`` sets the hold flag. A 3021, 3033,
         watchdog drop, or manual Reconnect clears it and reconnects
         in the gap. The stuck clock stays paused until the next open.
-        An EnterMonitorLONG hold already earlier than the open (the
-        closed-gap lead) stays there. The minute before the open
-        still waits until the open when no earlier hold is set (#157).
+        Outside the last minute, an EnterMonitorLONG hold already
+        earlier than the open stays there. Inside the last minute the
+        hold is the open. That minute is #157 and is not changed.
         """
         if is_market_open(now):
             return
@@ -2704,12 +2704,16 @@ class BacktestApp:
         if nxt is None:
             return
         machine.pause_stuck_clock_until(nxt)
+        # #157, unchanged: inside the last minute, hold until the open.
+        if (nxt - now) <= timedelta(minutes=1):
+            machine.hold_quote_enter_until(nxt)
+            return
         current = machine._quote_enter_not_before
-        # A hold already earlier than the open stays. The last minute
-        # still waits until the open when nothing earlier is set.
+        # Outside that minute, a lead earlier than the open stays.
+        # hold_quote_enter_until(nxt) would push it out to the open.
         if current is not None and current < nxt:
             return
-        if (nxt - now) <= timedelta(minutes=1) or current is not None:
+        if current is not None:
             machine.hold_quote_enter_until(nxt)
 
     def _link_host_tick(self, *, force: bool = False) -> None:

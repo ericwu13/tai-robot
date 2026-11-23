@@ -764,16 +764,18 @@ def test_closed_gap_is_connected_0_enters_at_the_lead(monkeypatch, drop, open_at
 
 
 def test_closed_gap_inside_the_lead_enters_after_settle(monkeypatch):
-    """08:35 and IsConnected 0: the 15-min hold is already due.
+    """08:35 and IsConnected 0: max(now, open−15min) is now.
 
-    Enter after the 5s settle. No extra wait until 08:45.
+    Enter after the 5s settle. No extra wait until 08:45. The last
+    minute is a separate rule and is not folded into this max.
     """
     drop = tpe(2026, 11, 12, 8, 35)
     open_at = tpe(2026, 11, 12, 8, 45)
     app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=5))
     _running(app)
     fake.force_quote_state = 0
-    assert app._closed_gap_enter_hold(drop, open_at) == _closed_gap_lead(open_at)
+    assert app._closed_gap_enter_hold(drop, open_at) == max(
+        drop, _closed_gap_lead(open_at))
     enters = fake.calls.count("EnterMonitorLONG")
     _replay_drop(app, fake, clock, drop)
     fired = drop + timedelta(seconds=15)
@@ -861,6 +863,30 @@ def test_hold_across_close_keeps_the_closed_gap_lead(monkeypatch):
     enters = fake.calls.count("EnterMonitorLONG")
     _tick(app, fake, clock, mid)
     assert fake.calls.count("EnterMonitorLONG") == enters
+
+
+def test_last_minute_across_close_still_holds_until_the_open(monkeypatch):
+    """#157 is not folded into the lead.
+
+    A lead set at 07:30 stays at 08:30 through 08:00. Inside the last
+    minute the across-close pass still holds EnterMonitor until 08:45.
+    """
+    drop = tpe(2026, 11, 12, 7, 30)
+    open_at = tpe(2026, 11, 12, 8, 45)
+    lead = _closed_gap_lead(open_at)
+    app, fake, clock, _logged = _ready(monkeypatch, drop - timedelta(minutes=20))
+    _running(app)
+    _replay_drop(app, fake, clock, drop)
+    fake.force_quote_state = 0
+    _fire_timeout(app, fake, clock, drop + timedelta(seconds=15))
+    machine = app._link_host.machine
+    assert machine._quote_enter_not_before == lead
+    late = open_at - timedelta(seconds=30)
+    clock["now"] = late
+    fake.set_now(late)
+    app._hold_quote_down_across_close(late)
+    assert machine._quote_enter_not_before == open_at
+    assert (open_at - late) <= timedelta(minutes=1)
 
 
 def test_open_session_timeout_enters_after_five_second_settle(monkeypatch):
