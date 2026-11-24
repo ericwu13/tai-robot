@@ -1566,7 +1566,7 @@ def _run_v2_live(
     )
 
     mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
-    # v1's session EMA (±1.5, 2h) and v2's (+1.0/-0.85, 10h, 0.45 hysteresis)
+    # v1's session EMA (±1.5, 2h) and v2's (+0.85/-0.85, 10h, 0.45 hysteresis)
     # are different scales. Read the previous mode before this pass stamps
     # it: only an already-live pass keeps session_net.
     was_live = state.get("pipeline_v2_mode") == "live"
@@ -1689,6 +1689,8 @@ def _run_v2_live(
                 drop_reason=item.get("drop_reason", ""),
                 cluster_id=item.get("cluster_id", ""),
                 dup_method=item.get("dup_method", ""),
+                similarity=item.get("similarity"),
+                matched_title=item.get("matched_title", ""),
                 v2_action=item.get("v2_action", ""),
                 v2_category=item.get("v2_category", ""),
                 v2_direction=item.get("v2_direction", ""),
@@ -1709,6 +1711,19 @@ def _run_v2_live(
         f"| run={net:+.2f}, session={cum:+.2f} -> vote: {direction or 'none'} "
         f"| {emb_note} ({report.elapsed_ms:.0f}ms)"
     )
+    for (dec, ev), rsig in zip(report.classified_items, report.routing.routed_signals):
+        title = str(dec.article.get("title") or "").replace("\n", " ")[:60]
+        print(f"    L4 {rsig.action} M{ev.materiality} T{ev.source_tier} {ev.direction} "
+              f"{rsig.weighted_score}/{rsig.full_score} {rsig.reject_reason} {title}")
+    if report.reweight_delta:
+        print(f"    reweight {report.reweight_delta:+.4f}")
+    state["v2_partial"] = [
+        {"title": c.representative_title[:80], "direction": c.classified_direction,
+         "materiality": c.classified_materiality, "tier": c.source_tier,
+         "outlets": len(c.outlets), "weight": c.applied_weight, "full": c.full_weight}
+        for c in pipe.clusterer.active
+        if c.routed and abs(c.applied_weight) < abs(c.full_weight)
+    ][:10]
     if api_error:
         print(f"  ⚠ Gemini API error: {api_error}")
 
@@ -1856,16 +1871,24 @@ def main() -> int:
         interval = cfg["interval_minutes"] * 60
         print(f"looping every {cfg['interval_minutes']}m")
         while True:
-            state = _recorded_pass(cfg, state, vote_out, state_path)
-            append_log(log_dir / LOG_NAME,
-                       f"{datetime.now(_TZ_TAIPEI):%Y-%m-%d %H:%M:%S} TPE | "
-                       f"scored {state.get('last_articles_scored', 0)} | "
-                       f"net {state.get('last_net_score', 0):+.2f}")
+            now = datetime.now(_TZ_TAIPEI)
+            state = _recorded_pass(cfg, state, vote_out, state_path, now=now)
+            append_log(log_dir / LOG_NAME, _loop_log_line(now, state))
             time.sleep(interval)
     else:
         state = _recorded_pass(cfg, state, vote_out, state_path)
 
     return 0
+
+
+def _loop_log_line(now: datetime, state: dict) -> str:
+    """One rss_scorer.log line. A pause must not reprint Friday's counts."""
+    if in_weekend_pause(now):
+        body = "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
+    else:
+        body = (f"scored {state.get('last_articles_scored', 0)} | "
+                f"net {state.get('last_net_score', 0):+.2f}")
+    return f"{now:%Y-%m-%d %H:%M:%S} TPE | {body}"
 
 
 def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
@@ -1874,18 +1897,22 @@ def _recorded_pass(cfg: dict, state: dict, vote_out: str, state_path: str,
     whose Gemini scoring failed (error_streak went up) is a failed run
     even though the process itself carries on.
 
-    ``now`` is passed to ``check_once`` (tests pin the clock; the weekend
-    pause would otherwise skip the pass on Sat/Sun)."""
+    ``now`` is computed once and passed to ``check_once`` (tests pin the
+    clock; the weekend pause would otherwise skip the pass on Sat/Sun)."""
+    now = now or datetime.now(_TZ_TAIPEI)
     with _run_recorder(Path(state_path).parent, "W3") as run:
         before = int(state.get("error_streak") or 0)
         run_cfg = dict(cfg, state_file=state_path)
         state = check_once(run_cfg, state, vote_out, now=now)
         save_state(state_path, state)
         run.exit_code = 0
-        run.result = (f"fetched {state.get('last_fetched', '-')} | "
-                      f"new {state.get('last_new', '-')} | "
-                      f"scored {state.get('last_articles_scored', 0)} | "
-                      f"net {float(state.get('session_net') or 0):+.2f}")
+        if in_weekend_pause(now):
+            run.result = "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
+        else:
+            run.result = (f"fetched {state.get('last_fetched', '-')} | "
+                          f"new {state.get('last_new', '-')} | "
+                          f"scored {state.get('last_articles_scored', 0)} | "
+                          f"net {float(state.get('session_net') or 0):+.2f}")
         if state.get("fetch_status") == "failed":
             n_fail = int(state.get("feeds_failed") or 0)
             brief = _feed_error_brief(state.get("last_feed_errors"))

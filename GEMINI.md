@@ -33,7 +33,7 @@
 - **Layer 4（[router.py](src/news/pipeline/router.py)）**：
   - 嚴格 5 條件放行閘門：`!is_price_recap_only && !is_duplicate && has_new_fact_delta && category != "DROP" && materiality >= 4`。
   - 來源分級權重（Tier 1 > Tier 2 > Tier 3；Tier 3 單獨不可觸發投票或斷路器）。
-  - **多空非對稱門檻與投票遲滯**：BEARISH `materiality >= 4`（Tier 1/2）立即放行防禦投票／快訊（門檻 `-0.85`）；BULLISH 須 `materiality == 5` 且通過 W2／SKCOM 新鮮量價與區域股指矛盾檢查（門檻 `+1.0`）；搭配 10 小時 EMA 半衰期與 `0.45` 撤票遲滯下限（含零新稿輪次衰減撤票）。
+  - **同一物料門檻、廣度加權與投票線**：路由與權重不含當日價格。多空皆 `materiality >= classifier.min_materiality_pass`（4）。權重 = sign x (M/5) x tier_weight（1.0/0.85/0.35）x min(1, 0.5+0.5*(b-1)/3)，b 為相異 outlet。session net ≥ 0.85 進多、≤ -0.85 進空；10 小時 EMA 半衰期與 `0.45` 撤票遲滯（含零新稿輪次衰減撤票）。
   - 預設維持投票制（`regime_vote_w3.json`），`signal.json (risk_off, severity: "high")` 需明確設定 `news.rss_emit_risk_off: true` 才啟用。
 
 ## 4. 工程鐵則

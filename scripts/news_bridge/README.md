@@ -47,9 +47,9 @@ affecting votes/signals:
   `GOVERNANCE_REGULATORY`, `CREDIT_FLOWS`, else `DROP`).
 - **Layer 4 (`src/news/pipeline/router.py`)** — Enforces the 5-condition
   release gate, source-tier authority (Tier 3 alone cannot trigger votes),
-  asymmetric directional gates (BEARISH `materiality >= 4`, threshold `-0.85`;
-  BULLISH `materiality == 5` + fresh W2/SKCOM confirmation with regional
-  contradiction checks, threshold `+1.0`), and 10h EMA + `0.45` withdrawal
+  one floor (`classifier.min_materiality_pass` = 4; no same-day price in routing
+  or weight). Weight = sign x (M/5) x tier_weight (1.0/0.85/0.35) x
+  min(1, 0.5+0.5*(b-1)/3) by distinct outlets; both sides vote at session net ≥ 0.85, and 10h EMA + `0.45` withdrawal
   hysteresis (including decay/withdrawal on 0-article runs). Opt-in
   `news.rss_emit_risk_off: true` allows Tier 1/2 M4+ market-confirmed bearish
   shocks to write `signal.json` (`severity: "high"`).

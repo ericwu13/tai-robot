@@ -191,6 +191,8 @@ def build_raw_record(
     drop_reason: str = "",
     cluster_id: str = "",
     dup_method: str = "",
+    similarity: float | None = None,
+    matched_title: str = "",
     v2_action: str = "",
     v2_category: str = "",
     v2_direction: str = "",
@@ -222,6 +224,10 @@ def build_raw_record(
         rec["cluster_id"] = str(cluster_id)[:80]
     if dup_method:
         rec["dup_method"] = str(dup_method)[:32]
+    if isinstance(similarity, (int, float)) and not isinstance(similarity, bool):
+        rec["similarity"] = round(float(similarity), 4)
+    if matched_title:
+        rec["matched_title"] = clean_text(str(matched_title), 300)
     if v2_action:
         rec["v2_action"] = str(v2_action)
     if v2_category:

@@ -311,6 +311,35 @@ class PriorEventContext:
     similarity: float = 0.0
 
 
+def outlet_key(article: dict) -> str:
+    """Replay outlet: `` - ([^-]+)$`` on the raw title, otherwise ``source``.
+
+    A trailing ``最新新聞`` mark on that piece is removed. The cluster's
+    outlet list, not this string, is what ``_MAX_CLUSTER_URLS`` caps.
+    """
+    title = str((article or {}).get("title") or "")
+    source = str((article or {}).get("source") or "")
+    m = re.search(r" - ([^-]+)$", title or "")
+    s = (m.group(1) if m else source or "").strip()
+    s = re.sub(r"\s*-\s*最新新聞$", "", s)
+    return s.lower()
+
+
+def _outlets_from(raw: dict) -> list[str]:
+    saved = raw.get("outlets")
+    if isinstance(saved, list) and saved:
+        return [str(x) for x in saved if str(x)][:_MAX_CLUSTER_URLS]
+    seeded = outlet_key({"title": "", "source": str(raw.get("representative_source") or "")})
+    return [seeded] if seeded else []
+
+
+def _remember_outlet(cluster: "EventCluster", article: dict) -> None:
+    key = outlet_key(article)
+    if key and key not in cluster.outlets:
+        cluster.outlets.append(key)
+        del cluster.outlets[:-_MAX_CLUSTER_URLS]
+
+
 @dataclass
 class EventCluster:
     cluster_id: str
@@ -333,6 +362,9 @@ class EventCluster:
     classified_direction: str = ""
     classified_materiality: int = 0
     routed: bool = False
+    outlets: list[str] = field(default_factory=list)
+    full_weight: float = 0.0
+    applied_weight: float = 0.0
 
     def to_dict(self, *, archived: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -358,6 +390,9 @@ class EventCluster:
             payload["representative_url"] = self.representative_url
             payload["canonical_urls"] = list(self.canonical_urls[-_MAX_CLUSTER_URLS:])
             payload["norm_keys"] = list(self.norm_keys[-_MAX_CLUSTER_KEYS:])
+            payload["outlets"] = list(self.outlets[-_MAX_CLUSTER_URLS:])
+            payload["full_weight"] = self.full_weight
+            payload["applied_weight"] = self.applied_weight
         return payload
 
     @classmethod
@@ -385,6 +420,9 @@ class EventCluster:
             classified_direction=str(raw.get("classified_direction") or ""),
             classified_materiality=int(raw.get("classified_materiality", 0)),
             routed=bool(raw.get("routed", False)),
+            outlets=_outlets_from(raw),
+            full_weight=float(raw.get("full_weight") or 0.0),
+            applied_weight=float(raw.get("applied_weight") or 0.0),
         )
 
 
@@ -561,6 +599,7 @@ class IncrementalEventClusterer:
         """Merge an article into *cluster*. Returns True if unrouted Tier 3 upgraded to Tier 1/2."""
         prev_tier = cluster.source_tier
         cluster.mention_count += 1
+        _remember_outlet(cluster, article)
         cluster.last_seen_at = seen_at
         if pf.canonical_url and pf.canonical_url not in cluster.canonical_urls:
             cluster.canonical_urls.append(pf.canonical_url)
@@ -745,6 +784,7 @@ class IncrementalEventClusterer:
                 simhashes=[sh] if sh else [],
                 canonical_urls=[pf.canonical_url] if pf.canonical_url else [],
                 norm_keys=[nkey] if nkey else [],
+                outlets=[key] if (key := outlet_key(art)) else [],
             )
             self.active.append(cluster)
             if len(self.active) > self._cfg.max_active_clusters:
@@ -774,6 +814,8 @@ class IncrementalEventClusterer:
         direction: str = "",
         materiality: int = 0,
         routed: bool = False,
+        full_weight: float = 0.0,
+        applied_weight: float = 0.0,
     ) -> None:
         """Attach Layer 3 classification and routing status onto a cluster."""
         for c in reversed(self.active):
@@ -782,6 +824,8 @@ class IncrementalEventClusterer:
                 c.classified_category = str(category or "")
                 c.classified_direction = str(direction or "")
                 c.classified_materiality = int(materiality or 0)
+                c.full_weight = float(full_weight)
+                c.applied_weight = float(applied_weight)
                 if routed:
                     c.routed = True
                 return

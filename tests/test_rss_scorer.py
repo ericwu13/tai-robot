@@ -1053,3 +1053,62 @@ class TestVoteWithdrawAndShadow:
                                       now=_WEEKDAY_EVE)
         assert state["shadow_session_net"] == pytest.approx(state["session_net"])
         assert state["session_net"] == pytest.approx(-0.5 * rss_scorer.REF_STORIES_PER_RUN)
+
+
+def test_l4_log_weekend_row_and_matched_title(tmp_path, capsys):
+    from src.news.pipeline import (
+        GeminiEventClassifier, LexicalFallbackEmbedder, NewsSignalPipeline, load_pipeline_config,
+    )
+    import rss_news_log
+    p_cfg = load_pipeline_config()
+    title = "Exclusive-Nvidia's accounting is a focus of US SEC investigation"
+    articles = [
+        {"guid": "g1", "title": title, "summary": "s", "source": "Reuters",
+         "link": "https://www.reuters.com/nvda-1", "published_dt": _WEEKDAY_EVE},
+        {"guid": "g2", "title": title, "summary": "s", "source": "Bloomberg",
+         "link": "https://www.bloomberg.com/nvda-2", "published_dt": _WEEKDAY_EVE},
+    ]
+    pipe = NewsSignalPipeline(
+        p_cfg, embedder=LexicalFallbackEmbedder(64),
+        classifier=GeminiEventClassifier(
+            p_cfg, api_key="fake",
+            transport=lambda _p: json.dumps({
+                "event_id": "x", "is_duplicate": False, "is_price_recap_only": False,
+                "has_new_fact_delta": True, "category": "GOVERNANCE_REGULATORY",
+                "entities": ["NVDA"], "direction": "BEARISH", "materiality": 5,
+                "horizon": "MULTI_DAY", "source_tier": 1, "mention_count": 1,
+                "summary_one_line": "SEC probe.",
+            }),
+        ),
+    )
+    log = tmp_path / "news" / "news_log.jsonl"
+    cfg = {
+        "feeds": ["https://example.com/rss"], "interval_minutes": 30,
+        "state_file": str(tmp_path / "state.json"), "news_log_path": str(log),
+        "gemini_api_key": "fake-key", "discord_webhook_url": "", "discord_mode": "off",
+        "pipeline_v2": "live", "filter_config": "", "emit_risk_off": False,
+        "embedding_provider": "lexical", "rss_model": "",
+    }
+    with patch("rss_scorer.fetch_all_feeds", return_value=articles), \
+         patch("rss_scorer._build_v2_pipeline", return_value=pipe):
+        rss_scorer.check_once(cfg, {"seen_guids": []}, str(tmp_path / "vote.json"), now=_WEEKDAY_EVE)
+    line = next(ln for ln in capsys.readouterr().out.splitlines() if ln.startswith("    L4 "))
+    assert "VOTE_BEARISH" in line and "M5" in line and "T1" in line and "BEARISH" in line
+    assert "/" in line and "Nvidia" in line
+    raw = rss_news_log.log_files(rss_news_log.default_raw_path(str(log)))
+    rows = [json.loads(x) for x in Path(raw[0]).read_text(encoding="utf-8").splitlines()]
+    dup = next(r for r in rows if r["pipeline_stage"] == "l2_duplicate")
+    assert dup["similarity"] == 1.0 and dup["matched_title"]
+    saturday = datetime(2026, 11, 14, 12, 0, tzinfo=_TPE)
+    state_path = tmp_path / "bridge" / "rss_scorer_state.json"
+    state_path.parent.mkdir(parents=True)
+    rss_scorer._recorded_pass(
+        {**cfg, "state_file": str(state_path), "pipeline_v2": "off"},
+        {"session_net": 1.25, "last_fetched": 40}, "", str(state_path), now=saturday,
+    )
+    row = json.loads((state_path.parent / "runs" / "W3.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+    assert row["result"] == "weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped"
+    assert "1.25" not in row["result"] and "fetched" not in row["result"]
+    log_line = rss_scorer._loop_log_line(saturday, {"last_articles_scored": 7, "last_net_score": 1.25})
+    assert log_line.endswith("weekend pause (Sat 05:00-Mon 05:00 TPE): scoring skipped")
+    assert "1.25" not in log_line and "scored" not in log_line

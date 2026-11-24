@@ -1367,7 +1367,8 @@ const App = {
       el("div", { class: "sub" }, `W3 新聞情緒・${sessionKey(p.session)}` + (w.known && !w.current ? "（今晚尚未評分）" : "")),
       el("div", { class: "num" }, signedSpan(net)),
       el("div", { class: "state" }, state,
-        w.eroding ? el("span", { class: "pend" }, `回落：峰值 ${signedText(peak)}`) : null),
+        w.eroding ? el("span", { class: "pend" }, `回落：峰值 ${signedText(peak)}`) : null,
+        (w.partial || []).length ? el("span", { class: "chip s-off" }, `部分權重 ${w.partial.length} 則`) : null),
       bar,
       el("div", { class: "gscale" }, el("span", null, (-span).toFixed(1)), el("span", null, `−${T} ｜ 0 ｜ +${T}`),
         el("span", null, "+" + span.toFixed(1))));
