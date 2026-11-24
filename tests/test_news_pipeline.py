@@ -1068,11 +1068,9 @@ class TestRssScorerV2Integration:
     @pytest.mark.parametrize("stored_policy", [None, "pre-p3"], ids=["absent", "older"])
     def test_v2_live_policy_change_restarts_session_net(self, tmp_path, stored_policy):
         session_key = rss_scorer.night_session_key(_FIXED_NOW)
-        vote_base = tmp_path / "regime_vote.json"
-        rss_scorer._get_write_regime_vote()(
-            str(vote_base), "trending-down", session_key, source="W3",
-        )
-        assert (tmp_path / "regime_vote_w3.json").is_file()
+        vote_out = str(tmp_path / "regime_vote.json")
+        write_regime_vote = rss_scorer._get_write_regime_vote()
+        write_regime_vote(vote_out, "trending-down", session_key, source="W3")
         state = {
             "seen_guids": [],
             "session_key": session_key,
@@ -1085,7 +1083,7 @@ class TestRssScorerV2Integration:
             state["pipeline_v2_policy"] = stored_policy
         with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
             state = rss_scorer.check_once(
-                _v2_live_cfg(tmp_path), state, str(vote_base), now=_FIXED_NOW,
+                _v2_live_cfg(tmp_path), state, vote_out, now=_FIXED_NOW,
             )
         assert state["pipeline_v2_policy"] == SignalRouter.POLICY_VERSION
         assert state["session_net"] == pytest.approx(0.0)

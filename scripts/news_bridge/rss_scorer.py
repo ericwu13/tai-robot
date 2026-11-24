@@ -1583,10 +1583,7 @@ def _run_v2_live(
         state["session_net"] = 0.0
         state["session_peak"] = 0.0
         state["v2_active_vote"] = ""
-        # A quiet pass below never reaches withdraw_w3_vote once net and
-        # v2_active_vote are empty, so the file would outlive the reset.
-        if withdraw_w3_vote(vote_out, session_key):
-            print("  VOTE WITHDRAWN: session reset cleared the held vote -> removed W3 vote")
+        withdraw_w3_vote(vote_out, session_key)  # quiet pass skips withdraw once both are empty
     active_vote = str(state.get("v2_active_vote") or "")
 
     if not guid_new:
