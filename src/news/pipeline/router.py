@@ -200,6 +200,8 @@ def ema_decay_for(half_life_hours: float, interval_minutes: float = 30.0) -> flo
 class SignalRouter:
     """Layer 4 router: one materiality floor and outlet-breadth weighting."""
 
+    POLICY_VERSION = "p3"  # bump when weights/gates change; W3 restarts its session net
+
     def __init__(self, config: PipelineConfig):
         self._cfg: PipelineConfig = config
         self._rt: RouterConfig = config.router

@@ -73,6 +73,7 @@ from src.news.pipeline import (  # noqa: E402
 )
 from src.news.circuit_breaker import BreakerState  # noqa: E402
 from src.news.regime_vote import read_regime_vote  # noqa: E402
+from src.news.pipeline.classifier import CLASSIFICATION_PROMPT  # noqa: E402
 from src.news.signal_file import read_signal  # noqa: E402
 
 _TZ_TPE = timezone(timedelta(hours=8))
@@ -163,6 +164,7 @@ class TestLayer1PreFilter:
             ("盤中速報 - 櫃買市場加權指數上漲6.88點至350.99點，漲幅2%", "Anue鉅亨"),
             ("Stocks rise after Anthropic IPO debut", "All News"),
             ("台積電ADR19日下跌2.4% 較台北交易溢價18%", "Yahoo股市 - 最新新聞"),
+            ("Stocks rally as investors return to tech", "All News"),
         ],
     )
     def test_pure_price_recaps_and_institutional_flows_dropped(self, title, source):
@@ -184,6 +186,9 @@ class TestLayer1PreFilter:
             ("Strong October jobs report dims Fed rate cut hopes", "Bloomberg Markets"),
             ("China Extends Pause on 24% US Tariffs", "Bloomberg Markets"),
             ("Taiwan's Currency Weakens Past 33 Against Dollar on Capital Outflows", "Bloomberg Markets"),
+            ("黃仁勳復職台股全面噴出 台積電期貨亮燈大漲203元", "Yahoo股市 - 最新新聞"),
+            ("Wall Street rallies as Nvidia reinstates Jensen Huang as CEO", "All News"),
+            ("Stocks rise as Huang’s return to Nvidia lifts chipmakers", "All News"),
         ],
     )
     def test_causal_event_headlines_protected_even_with_price_words(self, title, source):
@@ -460,6 +465,10 @@ class TestLayer3Classifier:
         assert "Prior related event (last 24-48h" in prompt
         assert "Initial SEC accounting probe" in prompt
         assert "SOXX: -2.10%" in prompt
+
+    def test_prompt_materiality5_rule_is_direction_neutral(self):
+        assert "Be conservative with BULLISH" not in CLASSIFICATION_PROMPT
+        assert "Be equally strict with BULLISH and BEARISH" in CLASSIFICATION_PROMPT
 
 
 # ── Phase 4: Layer 4 SignalRouter & Asymmetric Gates ─────────────────────
@@ -957,6 +966,7 @@ class TestRssScorerV2Integration:
             "session_net": -0.50,
             "v2_active_vote": "trending-down",
             "pipeline_v2_mode": "live",
+            "pipeline_v2_policy": SignalRouter.POLICY_VERSION,
         }
         with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
             state = rss_scorer.check_once(cfg, state, str(vote_base), now=_FIXED_NOW)
@@ -1040,6 +1050,7 @@ class TestRssScorerV2Integration:
             "session_net": _V1_CARRY_NET,
             "session_peak": 1.5,
             "pipeline_v2_mode": "live",
+            "pipeline_v2_policy": SignalRouter.POLICY_VERSION,
         }
         with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
             state = rss_scorer.check_once(cfg, state, str(vote_base), now=_FIXED_NOW)
@@ -1053,6 +1064,28 @@ class TestRssScorerV2Integration:
         assert state["v2_active_vote"] == "trending-up"
         # A quiet pass updates the held direction; it does not write the vote file.
         assert not (tmp_path / "regime_vote_w3.json").exists()
+
+    @pytest.mark.parametrize("stored_policy", [None, "pre-p3"], ids=["absent", "older"])
+    def test_v2_live_policy_change_restarts_session_net(self, tmp_path, stored_policy):
+        session_key = rss_scorer.night_session_key(_FIXED_NOW)
+        state = {
+            "seen_guids": [],
+            "session_key": session_key,
+            "session_net": -1.0625,
+            "session_peak": -1.0625,
+            "v2_active_vote": "trending-down",
+            "pipeline_v2_mode": "live",
+        }
+        if stored_policy is not None:
+            state["pipeline_v2_policy"] = stored_policy
+        with mock.patch.object(rss_scorer, "fetch_all_feeds", return_value=[]):
+            state = rss_scorer.check_once(
+                _v2_live_cfg(tmp_path), state, str(tmp_path / "regime_vote.json"), now=_FIXED_NOW,
+            )
+        assert state["pipeline_v2_policy"] == SignalRouter.POLICY_VERSION
+        assert state["session_net"] == pytest.approx(0.0)
+        assert state["session_peak"] == pytest.approx(0.0)
+        assert state["v2_active_vote"] == ""
 
     def test_dashboard_news_pulse_uses_v2_live_thresholds_and_hysteresis(self):
         session_key = rss_scorer.night_session_key(_FIXED_NOW)
@@ -1289,6 +1322,7 @@ class TestRssScorerV2Integration:
         saved_state = json.loads(state_file.read_text(encoding="utf-8"))
         assert "existing_guid" in saved_state["seen_guids"]  # preserved!
         assert saved_state["pipeline_v2_mode"] == "live"
+        assert saved_state["pipeline_v2_policy"] == SignalRouter.POLICY_VERSION
         assert saved_state["v2_active_vote"] == ""
         assert "pipeline_v2_clusters" not in saved_state
 

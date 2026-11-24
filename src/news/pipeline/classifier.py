@@ -103,8 +103,8 @@ Step 4 — Materiality (1-5) & Direction (TXF perspective):
   CapEx/ATM equity shock, major Broadcom/Micron guidance surprise, BofA FMS extreme positioning shift).
 - 3 = Moderate/incremental industry news (not actionable alone).
 - 1-2 = Noise, commentary, priced-in recap, or irrelevant small-cap.
-- Be conservative with BULLISH ratings (avoid media optimism bias): reserve materiality 5 BULLISH for
-  undeniable quantitative beats or major risk-clearing catalysts.
+- Be equally strict with BULLISH and BEARISH: reserve materiality 5 for undeniable quantitative beats or
+  misses, or major risk-on or risk-off catalysts.
 
 {prior_context_block}{market_context_block}Source: {source} (tier {source_tier}, mentions={mention_count})
 Headline: {headline}

@@ -455,6 +455,7 @@ def backfill_batches(
     if not dry_run and last_batch_dt is not None:
         res.final_session_state = {
             "pipeline_v2_mode": "live",
+            "pipeline_v2_policy": pipeline.router.POLICY_VERSION,
             "session_key": session_key,
             "session_net": session_net,
             "session_peak": session_peak,
