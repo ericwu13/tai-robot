@@ -1510,55 +1510,160 @@ def test_flush_waits_for_a_priority_send_and_times_out_when_it_blocks():
     assert time.monotonic() - started < 1.0
 
 
-def test_pre_boot_still_waiting_and_give_up_share_one_notifier(monkeypatch):
-    """The give-up flush must wait for the still-waiting send.
+def _discord_settings(**extra):
+    cfg = {
+        "discord_bot_token": "t",
+        "discord_channel_id": "1",
+        "discord_evolution_channel_id": "2",
+        "discord_daily_report_channel_id": "3",
+        "discord_regime_channel_id": "4",
+    }
+    cfg.update(extra)
+    return cfg
 
-    Two DiscordNotifier instances race: flush on the second does not
-    see the message queued on the first.
+
+def _notify_threads():
+    return [t for t in threading.enumerate()
+            if t.name == "discord-notify" and t.is_alive()]
+
+
+def test_pre_boot_still_waiting_and_give_up_share_one_notifier(monkeypatch):
+    """One notifier, and the give-up flush waits out the slower send.
+
+    Still-waiting stays inside the transport until the give-up flush is
+    waiting on that same worker. The give-up transport returns at once.
+    A flush that does not wait returns while still-waiting is in flight.
     """
     import src.live.headless_app as ha
     from src.live.discord_notify import DiscordNotifier
 
     made = []
-    sent = []
-    flushed = []
+    finished = []
     real_init = DiscordNotifier.__init__
-    real_flush = DiscordNotifier.flush
+    entered = threading.Event()
+    release = threading.Event()
 
     def _init(self, *args, **kwargs):
         made.append(self)
         real_init(self, *args, **kwargs)
 
     def _deliver(self, content, target):
-        sent.append(self)
+        if "Still waiting" in content:
+            entered.set()
+            release.wait(timeout=2)
+            finished.append(("wait", self))
+        elif "Auto-restart failed" in content:
+            finished.append(("fail", self))
         return True
 
-    def _flush(self, timeout_s=5.0):
-        flushed.append(self)
-        return real_flush(self, timeout_s)
+    def _unlock():
+        if not entered.wait(timeout=2) or not made:
+            return
+        note = made[0]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if getattr(note._idle_ready, "_waiters", None):
+                release.set()
+                return
+            time.sleep(0.001)
 
     monkeypatch.setattr(DiscordNotifier, "__init__", _init)
     monkeypatch.setattr(DiscordNotifier, "_deliver", _deliver)
-    monkeypatch.setattr(DiscordNotifier, "flush", _flush)
     monkeypatch.setattr(rb, "_discord", None)
-    monkeypatch.setattr(rb, "_load_settings", lambda: {
-        "discord_bot_token": "t",
-        "discord_channel_id": "1",
-        "discord_evolution_channel_id": "2",
-        "discord_daily_report_channel_id": "3",
-        "discord_regime_channel_id": "4",
-    })
-    ha._emit_restart_still_waiting(
-        9, 60.0, bot="night1", symbol="TMF00", order_symbol="TM0000")
-    ha._emit_restart_failed(
-        "old process still alive", detail="pid 9", bot="night1", symbol="TMF00")
-    assert len(made) == 1
-    assert sent and all(item is made[0] for item in sent)
-    assert flushed == [made[0]]
-    assert rb._discord is made[0]
-    assert made[0]._evolution_channel_id == "2"
-    assert made[0]._daily_report_channel_id == "3"
-    assert made[0]._regime_channel_id == "4"
+    monkeypatch.setattr(rb, "_load_settings", _discord_settings)
+    unlocker = threading.Thread(target=_unlock, name="release-still-waiting",
+                                daemon=True)
+    unlocker.start()
+    try:
+        ha._emit_restart_still_waiting(
+            9, 60.0, bot="night1", symbol="TMF00", order_symbol="TM0000")
+        assert entered.wait(timeout=2)
+        ha._emit_restart_failed(
+            "old process still alive", detail="pid 9", bot="night1",
+            symbol="TMF00")
+        kinds = [kind for kind, _note in finished]
+        assert len(made) == 1
+        assert kinds[:2] == ["wait", "fail"]
+        assert all(note is made[0] for _kind, note in finished)
+        assert rb._discord is made[0]
+        assert made[0]._evolution_channel_id == "2"
+        assert made[0]._daily_report_channel_id == "3"
+        assert made[0]._regime_channel_id == "4"
+    finally:
+        release.set()
+        unlocker.join(timeout=2)
+
+
+def test_happy_path_deploy_keeps_the_pre_boot_notifier(tmp_path, monkeypatch):
+    """Old pid exits after still-waiting. Deploy keeps that notifier.
+
+    No second ``DiscordNotifier`` and no second ``discord-notify`` worker.
+    Deploy only writes the bot name, symbol, and channel ids.
+    """
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+    from tests.test_heartbeat_wiring import _Strategy, _app, _cleanup, _install_runner
+
+    made = []
+    real_init = DiscordNotifier.__init__
+
+    def _init(self, *args, **kwargs):
+        made.append(self)
+        real_init(self, *args, **kwargs)
+
+    def _deliver(self, content, target):
+        return True
+
+    monkeypatch.setattr(DiscordNotifier, "__init__", _init)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _deliver)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", _discord_settings)
+    monkeypatch.setattr(dr, "wait_for_old_pid", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        dr, "poll_old_pid_until_exit_or_budget",
+        lambda *_a, **_k: ("exited", None))
+    _patch_project(monkeypatch, tmp_path)
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    app = _app(bot_dir)
+    app._settings = _discord_settings(
+        discord_channel_id="9",
+        discord_evolution_channel_id="evo",
+        discord_daily_report_channel_id="day",
+        discord_regime_channel_id="reg",
+    )
+    app._start_live_warmup = lambda: None
+    before = {t.ident for t in _notify_threads()}
+
+    def _boot(*_a, **_k):
+        return app, EXIT_OK
+
+    def _drive(_driver, app_):
+        assert app_._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "night1") is True
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    try:
+        args, _live = _deploy_args(tmp_path, wait_for_pid=77)
+        code = run_deploy(args)
+        assert code == EXIT_OK
+        assert len(made) == 1
+        pre = made[0]
+        assert rb._discord is pre
+        assert pre._bot_name == "night1"
+        assert pre._symbol == "TMF00"
+        assert pre._evolution_channel_id == "evo"
+        assert pre._daily_report_channel_id == "day"
+        assert pre._regime_channel_id == "reg"
+        spawned = [t for t in _notify_threads() if t.ident not in before]
+        assert spawned == [pre._worker]
+        assert pre._worker is not None and pre._worker.is_alive()
+    finally:
+        _cleanup()
 
 
 def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path):
