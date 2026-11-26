@@ -42,9 +42,19 @@ HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
 SEND_QUEUE_MAX = 200
 PRIORITY_BACKLOG_MAX = 200
-# A send that raises is put back this many times, then abandoned so the
-# next notification still goes out. Zero would drop it on the first error.
+# A send that raises, or whose ``_deliver`` returns False, is put back
+# this many times, then abandoned so the next notification still goes out.
+# Zero would drop it on the first error.
 WORKER_SEND_RETRIES = 1
+# Exit flush waits one ``_deliver`` 429 cycle (3 posts + 1s/2s/4s) for the
+# original send and one worker retry, plus connect. The old process caps
+# this further so the flush cannot eat the child's pid wait.
+FLUSH_EXIT_TIMEOUT_S = (
+    (HTTP_TIMEOUT_S * 3 + 1 + 2 + 4) * (1 + WORKER_SEND_RETRIES)
+    + CONNECT_TIMEOUT_S
+)
+# One 429 sleep never exceeds this, even when Retry-After is larger.
+RETRY_AFTER_SLEEP_CAP_S = 15.0
 
 # Trading mode → readable bilingual label for the mode-switch notification.
 _MODE_LABELS = {
@@ -56,6 +66,24 @@ _MODE_LABELS = {
 
 def _taipei_now() -> datetime:
     return datetime.now(_TPE)
+
+
+def _retry_after_sleep_s(resp, delay: float) -> float:
+    """Seconds to sleep after one HTTP 429. Unparsable keeps ``delay``."""
+    raw = None
+    headers = getattr(resp, "headers", None)
+    if headers is not None:
+        try:
+            raw = headers.get("Retry-After")
+        except Exception:
+            raw = None
+    if raw is None:
+        return delay
+    try:
+        parsed = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return delay
+    return min(RETRY_AFTER_SLEEP_CAP_S, max(float(delay), parsed))
 
 
 class DiscordNotifier:
@@ -129,8 +157,11 @@ class DiscordNotifier:
         are dropped only when that deque is full. The default stays
         routine so a caller that does not opt in cannot fill that deque.
 
-        HTTP 429 is retried by the worker (1s, 2s, 4s), not by enqueueing
-        again, so a retry cannot be dropped because the queue is full.
+        HTTP 429 is retried inside ``_deliver`` (backoff 1s, 2s, 4s, or
+        ``Retry-After`` when that header is longer, capped at 15s), not by
+        enqueueing again, so a retry cannot be dropped because the queue
+        is full. A False return is one worker retry
+        (``WORKER_SEND_RETRIES``).
         """
         if not self.enabled:
             return
@@ -241,24 +272,29 @@ class DiscordNotifier:
             queued = False
             sent_ok = False
             try:
-                item, from_backlog, queued = self._next_item()
-                content, target = item[0], item[1]
-                ok = self._deliver(content, target)
-                sent_ok = True
-                waited = item[4] if len(item) > 4 else False
-                if from_backlog and ok and waited:
-                    with self._state_lock:
-                        self._late += 1
-                if ok:
-                    # Catch-up runs before task_done so this item's success
-                    # and the one summary stay in that order.
-                    self._post_stall_summary()
-            except Exception:
-                logger.exception(
-                    "Discord worker error (bot=%s)", self._bot_name)
+                try:
+                    item, from_backlog, queued = self._next_item()
+                    content, target = item[0], item[1]
+                    ok = self._deliver(content, target)
+                    # False is a failed POST. ``_deliver`` catches network
+                    # errors and does not raise, so the retry has to see it.
+                    sent_ok = bool(ok)
+                    waited = item[4] if len(item) > 4 else False
+                    if from_backlog and ok and waited:
+                        with self._state_lock:
+                            self._late += 1
+                    if ok:
+                        # Catch-up runs before task_done so this item's
+                        # success and the one summary stay in that order.
+                        self._post_stall_summary()
+                except Exception:
+                    logger.exception(
+                        "Discord worker error (bot=%s)", self._bot_name)
                 # The item was already popped. Put it back once so a
-                # transient error does not lose a backlog message, then
-                # keep looping. A second failure is abandoned.
+                # transient error or a False delivery does not lose it.
+                # A second failure is abandoned. Requeue before the
+                # finally block clears ``_in_flight``, or flush can
+                # return while this send is still pending.
                 if item is not None and not sent_ok:
                     self._retry_failed_item(item, from_backlog)
             finally:
@@ -270,7 +306,7 @@ class DiscordNotifier:
                     self._queue.task_done()
 
     def _retry_failed_item(self, item, from_backlog: bool) -> None:
-        """Requeue a send that raised, at most ``WORKER_SEND_RETRIES`` times."""
+        """Requeue a failed send, at most ``WORKER_SEND_RETRIES`` times."""
         tries = item[3] if len(item) > 3 else 0
         if tries >= WORKER_SEND_RETRIES:
             return
@@ -342,6 +378,8 @@ class DiscordNotifier:
     def _deliver(self, content: str, target: str) -> bool:
         """POST one message. Retry HTTP 429 with backoff 1s, 2s, 4s.
 
+        A 429 ``Retry-After`` in seconds raises that one sleep, capped at
+        ``RETRY_AFTER_SLEEP_CAP_S``. An unparsable header keeps the backoff.
         Returns True when Discord accepted the message. The lock is not
         held across the backoff sleep, and a 429 never re-enters the queue.
         """
@@ -367,7 +405,7 @@ class DiscordNotifier:
                         )
                         return False
                     return True
-                time.sleep(delay)
+                time.sleep(_retry_after_sleep_s(resp, delay))
                 delay *= 2
             logger.warning(
                 "Discord send failed after 3 retries (429 rate-limited), "

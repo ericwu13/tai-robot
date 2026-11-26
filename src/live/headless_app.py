@@ -670,7 +670,13 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     A replacement that dies at pid-wait, relogin, login, or the pre-deploy
     position prompt has not run ``_deploy_live_continue``, so ``rb._discord``
     is still None. An already installed notifier is returned as-is.
+    Discord warnings are attached here so a failure before that deploy
+    still reaches stdout.
     """
+    try:
+        rb.attach_app_log_handlers()
+    except Exception:
+        pass
     current = getattr(rb, "_discord", None)
     if current is not None:
         return current
@@ -693,16 +699,40 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
 
 
-def _flush_discord(discord) -> None:
+def _log_discord_flush(discord, timeout_s: float) -> bool:
+    """Wait out one in-flight send. Log True/False. Never raises."""
     if discord is None or not getattr(discord, "enabled", False):
-        return
+        return True
     flush = getattr(discord, "flush", None)
     if not callable(flush):
-        return
+        return True
     try:
-        flush(timeout_s=5.0)
+        ok = bool(flush(timeout_s=timeout_s))
     except Exception as exc:
-        rb._log(f"[HEADLESS] discord flush failed: [{type(exc).__name__}] {exc}")
+        ok = False
+        try:
+            rb._log(f"[HEADLESS] discord flush failed: "
+                    f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+    try:
+        rb._log(f"[HEADLESS] discord flush {ok}")
+    except Exception:
+        pass
+    if not ok:
+        try:
+            rb._log("[HEADLESS] discord send may have been cut off")
+        except Exception:
+            pass
+    return ok
+
+
+def _flush_discord(discord) -> None:
+    """Old-process flush after spawn. Capped so the child keeps pid-wait time."""
+    from src.live.degraded_restart import PID_WAIT_S
+    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+    timeout_s = min(float(FLUSH_EXIT_TIMEOUT_S), float(PID_WAIT_S) - 5.0)
+    _log_discord_flush(discord, timeout_s)
 
 
 def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
@@ -721,9 +751,8 @@ def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
                 f"自動重啟失敗 Auto-restart failed: {reason} {detail}",
                 priority=True,
             )
-        flush = getattr(discord, "flush", None)
-        if callable(flush):
-            flush(timeout_s=5.0)
+        from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+        _log_discord_flush(discord, FLUSH_EXIT_TIMEOUT_S)
     except Exception as exc:
         rb._log(f"[HEADLESS] restart-failed alert failed: "
                 f"[{type(exc).__name__}] {exc}")
@@ -757,7 +786,7 @@ def _spawn_pending_restart(driver, code: int) -> int:
                    else os.path.join(os.getcwd(), "cli_stdout.log"))
     try:
         from src.paths import project_root
-        spawn_detached(cmd, stdout_path, cwd=project_root())
+        proc = spawn_detached(cmd, stdout_path, cwd=project_root())
     except OSError as exc:
         symbol = str(getattr(getattr(driver, "args", None), "symbol", "") or "")
         _emit_restart_failed(
@@ -770,6 +799,10 @@ def _spawn_pending_restart(driver, code: int) -> int:
             from src.live.degraded_restart import clear_pending_notify
             clear_pending_notify(bot_dir)
         return EXIT_BOT_STOPPED
+    try:
+        rb._log(f"[HEADLESS] spawned replacement pid={proc.pid}")
+    except Exception:
+        pass
     _flush_discord(getattr(rb, "_discord", None))
     return code
 
@@ -785,6 +818,16 @@ def run_deploy(args) -> int:
     symbol = str(getattr(args, "symbol", "") or "")
     old_pid = int(getattr(args, "wait_for_pid", 0) or 0)
     if old_pid > 0:
+        # Before _boot, so a pid-wait warning is on stdout. Deploy's
+        # own attach runs only after the wait succeeds.
+        try:
+            rb.attach_app_log_handlers()
+        except Exception:
+            pass
+        try:
+            rb._log(f"[HEADLESS] pid-wait start old={old_pid}")
+        except Exception:
+            pass
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
             _emit_restart_failed(
                 "old process still alive",
@@ -870,5 +913,9 @@ def _teardown(app: HeadlessBotApp) -> None:
         pass
     try:
         app.root.destroy()
+    except Exception:
+        pass
+    try:
+        rb._log("[HEADLESS] root.destroy done")
     except Exception:
         pass

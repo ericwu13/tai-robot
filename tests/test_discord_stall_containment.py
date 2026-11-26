@@ -206,8 +206,10 @@ def test_a_normal_send_still_takes_the_lock_and_posts(monkeypatch):
 def test_lock_is_released_when_the_post_raises(monkeypatch):
     """A raising transport releases the lock and the next send still posts.
 
-    Both happen on the same worker. Master already released the lock, and
-    the follow-up send started a second thread.
+    ``_deliver`` returns False, so the worker retries that send once.
+    Both happen on the same worker. Master already released the lock, the
+    follow-up send started a second thread, and a False delivery was not
+    retried.
     """
     n = _notifier()
     calls = []
@@ -224,9 +226,16 @@ def test_lock_is_released_when_the_post_raises(monkeypatch):
     with _spy_threads() as born:
         n._send("boom")
         n._send("next")
-        _wait_until(lambda: len(calls) >= 2 and not n._http_lock.locked())
+        # ``_deliver`` swallows the OSError and returns False. The worker
+        # retries that send once, then posts the next message.
+        _wait_until(
+            lambda: calls.count("boom") >= 1 + discord_notify.WORKER_SEND_RETRIES
+            and "next" in calls
+            and not n._http_lock.locked())
     assert len(born) == 1
-    assert calls == ["boom", "next"]
+    assert calls[0] == "boom"
+    assert calls.count("boom") == 1 + discord_notify.WORKER_SEND_RETRIES
+    assert calls.count("next") == 1
     assert not n._http_lock.locked()
 
 

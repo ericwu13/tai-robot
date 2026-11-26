@@ -70,7 +70,9 @@ def test_spawn_guard_runs_before_tk_import():
     assert "_init_com()" not in pre_tk
     bottom = text.split('if __name__ == "__main__":')[-1]
     assert bottom.index("dispatch_entry") < bottom.index("import run_bot_cli")
-    assert "sys.exit(run_bot_cli.main(routed))" in bottom
+    assert "run_bot_cli.main(routed)" in bottom
+    assert bottom.index("run_bot_cli.main(routed)") < bottom.index(
+        "note_return_from_main()") < bottom.index("sys.exit(")
     assert "\n    main()\n" in bottom
     assert "enable_dpi_awareness()" not in bottom
     assert "_init_com()" not in bottom

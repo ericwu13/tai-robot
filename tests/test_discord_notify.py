@@ -29,3 +29,84 @@ def test_fill_timeout_restored_names_the_order_and_is_priority():
     assert "全自動" in content
     assert "交易模式切換" not in content
     assert "Downgraded to semi-auto" not in content
+
+
+def test_false_deliver_is_retried_by_the_worker():
+    """A False from ``_deliver`` is a failed send. The worker retries it."""
+    import threading
+
+    note = DiscordNotifier("token", "999", bot_name="night1")
+    calls = []
+    retried = []
+    done = threading.Event()
+
+    def _deliver(content, target):
+        calls.append(content)
+        if len(calls) == 1:
+            return False
+        done.set()
+        return True
+
+    orig = note._retry_failed_item
+
+    def _spy(item, from_backlog):
+        retried.append(item[0])
+        return orig(item, from_backlog)
+
+    note._deliver = _deliver
+    note._retry_failed_item = _spy
+    note._send("ping", priority=True)
+    assert done.wait(3), calls
+    assert calls == ["ping", "ping"]
+    assert retried == ["ping"]
+
+
+def test_retry_after_header_sets_the_429_sleep_and_caps_it(monkeypatch):
+    import src.live.discord_notify as dn
+
+    sleeps = []
+    monkeypatch.setattr(dn.time, "sleep", lambda delay: sleeps.append(delay))
+
+    class _Resp:
+        def __init__(self, code, retry_after=None):
+            self.status_code = code
+            self.text = ""
+            self.headers = {}
+            if retry_after is not None:
+                self.headers["Retry-After"] = retry_after
+
+    class _Client:
+        def __init__(self, responses):
+            self._responses = list(responses)
+
+        def post(self, *args, **kwargs):
+            return self._responses.pop(0)
+
+    def _run(responses):
+        sleeps.clear()
+        note = DiscordNotifier("token", "999", bot_name="b")
+        note._http = _Client(responses)
+        return note._deliver("hi", "999")
+
+    assert _run([_Resp(429, "3"), _Resp(200)]) is True
+    assert sleeps == [3.0]
+
+    assert _run([_Resp(429, "999")] * 3) is False
+    assert sleeps == [15.0, 15.0, 15.0]
+
+    assert _run([_Resp(429, "soon")] * 3) is False
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_flush_exit_timeout_matches_the_429_cycle():
+    from src.live.discord_notify import (
+        CONNECT_TIMEOUT_S,
+        FLUSH_EXIT_TIMEOUT_S,
+        HTTP_TIMEOUT_S,
+        WORKER_SEND_RETRIES,
+    )
+
+    assert FLUSH_EXIT_TIMEOUT_S == (
+        (HTTP_TIMEOUT_S * 3 + 1 + 2 + 4) * (1 + WORKER_SEND_RETRIES)
+        + CONNECT_TIMEOUT_S
+    )

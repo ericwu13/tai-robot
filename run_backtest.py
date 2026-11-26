@@ -13,6 +13,7 @@ Usage:
 
 from version import APP_VERSION
 
+import atexit
 import csv
 import faulthandler
 import logging
@@ -1212,6 +1213,32 @@ class _AppLogHandler(logging.Handler):
             _log(self.format(record))
         except Exception:
             pass
+
+
+_APP_LOG_NAMES = (
+    "src.live.discord_notify",
+    "src.live.live_runner",
+    "src.live.regime_switching_runner",
+    "src.live.tick_watchdog",
+    "src.market_data.holidays",
+)
+
+
+def attach_app_log_handlers(names=_APP_LOG_NAMES) -> None:
+    """Route live-module logs through ``_log`` (stdout, flush=True).
+
+    Idempotent. Called from deploy and, earlier, from a headless waiter
+    that has not reached ``_deploy_live_continue`` yet.
+    """
+    for logger_name in names:
+        mod_logger = logging.getLogger(logger_name)
+        if any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
+            mod_logger.setLevel(logging.DEBUG)
+            continue
+        handler = _AppLogHandler()
+        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+        mod_logger.addHandler(handler)
+        mod_logger.setLevel(logging.DEBUG)
 
 
 def _log_debug(msg):
@@ -3019,16 +3046,37 @@ class BacktestApp:
                 pass
 
     def _shutdown_link(self) -> None:
-        """User shutdown. The only LeaveMonitor the live host asks for."""
+        """User shutdown. The only LeaveMonitor the live host asks for.
+
+        Then arm the exit dump and release COM. ``_stop_live`` does not
+        call this: a GUI Stop Bot keeps the process and its COM alive.
+        """
         self._cancel_reply_poll()
         host = getattr(self, "_link_host", None)
-        if host is None:
-            return
+        if host is not None:
+            try:
+                host.shutdown(_taipei_now())
+            except Exception as e:
+                _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
+            self._link_host = None
+        # LeaveMonitor (or the skip) has returned. Arm while the
+        # apartment is still alive, then Unadvise, then drop the refs.
         try:
-            host.shutdown(_taipei_now())
+            arm_process_exit_diagnostics()
         except Exception as e:
-            _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
-        self._link_host = None
+            try:
+                _log(f"[HEADLESS] exit diagnostics failed: "
+                     f"[{type(e).__name__}] {e}")
+            except Exception:
+                pass
+        try:
+            release_com_connections()
+        except Exception as e:
+            try:
+                _log(f"[HEADLESS] COM release failed: "
+                     f"[{type(e).__name__}] {e}")
+            except Exception:
+                pass
 
     def _on_reconnected(self):
         """Resubscribe after the machine has seen quote READY (3003).
@@ -4610,7 +4658,14 @@ class BacktestApp:
         """Handle window close: auto-save chat, drop the quote link, destroy."""
         self._auto_save_chat()
         self._shutdown_link()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        try:
+            _log("[HEADLESS] root.destroy done")
+        except Exception:
+            pass
 
     # ══════════════════════════════════════════════════════════════
     #  SELF-UPDATE
@@ -9955,16 +10010,7 @@ class BacktestApp:
                 regime_logger.setLevel(logging.DEBUG)
 
         # Route Discord and LiveRunner logging into the app's _log()
-        for logger_name in ("src.live.discord_notify", "src.live.live_runner",
-                            "src.live.regime_switching_runner",
-                            "src.live.tick_watchdog",
-                            "src.market_data.holidays"):
-            mod_logger = logging.getLogger(logger_name)
-            if not any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
-                h = _AppLogHandler()
-                h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
-                mod_logger.addHandler(h)
-                mod_logger.setLevel(logging.DEBUG)
+        attach_app_log_handlers()
 
         # Initialize Discord notifications
         global _discord
@@ -13772,6 +13818,9 @@ class BacktestApp:
 # Event sinks + comtypes connections must outlive the event loop; keep them
 # referenced at module level (shared by the GUI main() and the headless CLI).
 _com_event_handlers: list = []
+_com_released = False
+_exit_dump_skip_logged = False
+_comtypes_atexit_wrapped = False
 
 
 def _bind_event_sink(kind: str, com_obj, handler, get_events):
@@ -13798,6 +13847,177 @@ def register_com_events() -> None:
         _bind_event_sink, comtypes.client.GetEvents)
 
 
+def _comtypes_shutdown_fn():
+    """The callable comtypes registered with atexit, or None."""
+    mod = sys.modules.get("comtypes")
+    fn = getattr(mod, "_shutdown", None) if mod is not None else None
+    if callable(fn):
+        return fn
+    try:
+        from comtypes._post_coinit.unknwn import _shutdown as fn
+    except Exception:
+        return None
+    return fn if callable(fn) else None
+
+
+def _attach_comtypes_log_handler() -> None:
+    """DEBUG on the comtypes logger, through ``_log``. Once."""
+    log = logging.getLogger("comtypes")
+    if not any(isinstance(h, _AppLogHandler) for h in log.handlers):
+        handler = _AppLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+
+
+def _arm_exit_traceback_dump() -> None:
+    """30s hang dump into the existing faulthandler handle. Never opens a file."""
+    global _exit_dump_skip_logged
+    handle = _faulthandler_log
+    open_ok = handle is not None and not getattr(handle, "closed", True)
+    if not open_ok:
+        if _exit_dump_skip_logged:
+            return
+        _exit_dump_skip_logged = True
+        try:
+            _log("[HEADLESS] faulthandler exit dump skipped: no open handle")
+        except Exception:
+            pass
+        return
+    try:
+        faulthandler.dump_traceback_later(30, exit=False, file=handle)
+    except Exception as exc:
+        try:
+            _log(f"[HEADLESS] faulthandler exit dump not armed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+
+
+def _arm_comtypes_atexit() -> None:
+    """Bracket comtypes ``CoUninitialize`` with atexit begin/end. Once."""
+    global _comtypes_atexit_wrapped
+    if _comtypes_atexit_wrapped:
+        return
+    _comtypes_atexit_wrapped = True
+    if "comtypes" not in sys.modules:
+        try:
+            _log("[HEADLESS] comtypes not loaded; "
+                 "skip atexit CoUninitialize wrap")
+        except Exception:
+            pass
+        return
+    try:
+        _attach_comtypes_log_handler()
+    except Exception:
+        pass
+    original = _comtypes_shutdown_fn()
+    if original is None:
+        try:
+            _log("[HEADLESS] comtypes _shutdown missing; skip atexit wrap")
+        except Exception:
+            pass
+        return
+    try:
+        atexit.unregister(original)
+    except Exception as exc:
+        try:
+            _log(f"[HEADLESS] atexit unregister failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+        return
+
+    def _wrapped() -> None:
+        try:
+            _log("atexit begin")
+        except Exception:
+            pass
+        try:
+            original()
+        finally:
+            try:
+                _log("atexit end")
+            except Exception:
+                pass
+
+    try:
+        atexit.register(_wrapped)
+    except Exception as exc:
+        try:
+            _log(f"[HEADLESS] atexit register failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+
+
+def arm_process_exit_diagnostics() -> None:
+    """After LeaveMonitor, before Unadvise. Never raises."""
+    try:
+        _arm_exit_traceback_dump()
+    except Exception as exc:
+        try:
+            _log(f"[HEADLESS] exit dump arm failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+    try:
+        _arm_comtypes_atexit()
+    except Exception as exc:
+        try:
+            _log(f"[HEADLESS] comtypes atexit arm failed: "
+                 f"[{type(exc).__name__}] {exc}")
+        except Exception:
+            pass
+
+
+def release_com_connections() -> None:
+    """Unadvise event sinks and drop SKCOM refs. Idempotent. Never raises."""
+    global _com_released, skC, skQ, skR, skO
+    if _com_released:
+        return
+    _com_released = True
+    ok = 0
+    try:
+        handlers = list(_com_event_handlers)
+    except Exception:
+        handlers = []
+    for obj in handlers:
+        disconnect = getattr(obj, "disconnect", None)
+        if not callable(disconnect):
+            continue
+        try:
+            disconnect()
+        except Exception:
+            continue
+        ok += 1
+    try:
+        _com_event_handlers.clear()
+    except Exception:
+        pass
+    skC = skQ = skR = skO = None
+    try:
+        _log(f"[HEADLESS] COM disconnect ok={ok}")
+    except Exception:
+        pass
+
+
+def note_return_from_main() -> None:
+    """Log that main is returning and cancel the post-LeaveMonitor hang dump.
+
+    Cancel only here. A hang inside destroy, flush, or CoUninitialize
+    must still dump.
+    """
+    try:
+        _log("[HEADLESS] return from main")
+    except Exception:
+        pass
+    try:
+        faulthandler.cancel_dump_traceback_later()
+    except Exception:
+        pass
+
+
 def main():
     # First: COM init and Tk both create (hidden) windows, and DPI
     # awareness can only be set before the process owns any window.
@@ -13808,6 +14028,10 @@ def main():
     root = tk.Tk()
     app = BacktestApp(root)
     root.mainloop()
+    try:
+        note_return_from_main()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
@@ -13823,7 +14047,12 @@ if __name__ == "__main__":
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
-        sys.exit(run_bot_cli.main(routed))
+        _code = run_bot_cli.main(routed)
+        try:
+            note_return_from_main()
+        except Exception:
+            pass
+        sys.exit(_code)
     if kind != "gui":
         raise SystemExit(0)
     main()
