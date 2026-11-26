@@ -1201,6 +1201,63 @@ def test_enter_monitor_return_code_is_logged(monkeypatch):
     assert "code=7" in text
 
 
+def _com_lines(logs, name, status):
+    return [line for line in logs if f"[COM] {name} {status}" in line]
+
+
+def test_link_com_return_codes_are_logged(monkeypatch):
+    """LoginSetQuote and LeaveMonitor log their codes. A raise does not."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log_debug", lambda msg: logs.append(str(msg)))
+    monkeypatch.setattr(rb, "_last_is_connected", None, raising=False)
+    hb.set_com_return_logger(rb._log_com_return)
+
+    def _boom():
+        raise RuntimeError("com-boom")
+
+    try:
+        assert hb.call_com("LoginSetQuote", lambda: 2003) == 2003
+        assert hb.call_com("LeaveMonitor", lambda: 9999) == 9999
+        assert hb.call_com("RequestTicks", lambda: 5) == 5
+        with pytest.raises(RuntimeError, match="com-boom"):
+            hb.call_com("LoginSetQuote", _boom)
+    finally:
+        hb.set_com_return_logger(rb._log_com_return)
+
+    login = _com_lines(logs, "LoginSetQuote", "returned")
+    leave = _com_lines(logs, "LeaveMonitor", "returned")
+    ticks = _com_lines(logs, "RequestTicks", "returned")
+    raised = _com_lines(logs, "LoginSetQuote", "raised")
+    assert len(login) == 1 and "code=2003" in login[0]
+    assert len(leave) == 1 and "code=9999" in leave[0]
+    assert len(ticks) == 1 and "code=" not in ticks[0]
+    assert len(raised) == 1
+    assert "raised" in raised[0]
+    assert "code=" not in raised[0]
+
+
+def test_is_connected_code_logged_only_on_change(monkeypatch):
+    """IsConnected keeps one [COM] line per call and suffixes code= on change."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log_debug", lambda msg: logs.append(str(msg)))
+    monkeypatch.setattr(rb, "_last_is_connected", None, raising=False)
+    hb.set_com_return_logger(rb._log_com_return)
+    values = (1, 1, 0, 0, 1)
+    try:
+        for value in values:
+            assert hb.call_com("IsConnected", lambda v=value: v) == value
+    finally:
+        hb.set_com_return_logger(rb._log_com_return)
+
+    lines = _com_lines(logs, "IsConnected", "returned")
+    assert len(lines) == 5
+    expect = (True, False, True, False, True)
+    for line, want, value in zip(lines, expect, values):
+        assert ("code=" in line) is want
+        if want:
+            assert f"code={value}" in line
+
+
 def _closed_gap_down(monkeypatch, state=0):
     """07:30 3002 with no fresh tick.
 
