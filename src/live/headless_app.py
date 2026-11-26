@@ -798,8 +798,6 @@ def _spawn_pending_restart(driver, code: int) -> int:
     bot_dir = getattr(driver, "bot_dir", "") or ""
     stdout_path = (cli_stdout_path(bot_dir) if bot_dir
                    else os.path.join(os.getcwd(), "cli_stdout.log"))
-    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
-    _log_discord_flush(getattr(rb, "_discord", None), FLUSH_EXIT_TIMEOUT_S)
     try:
         from src.paths import project_root
         proc = spawn_detached(cmd, stdout_path, cwd=project_root())
