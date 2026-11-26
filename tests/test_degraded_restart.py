@@ -1145,22 +1145,22 @@ def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
         tmp_path, monkeypatch):
     """Quote symbol still has budget; the front-month order symbol does not.
 
-    2026-11-18 13:16 TPE is that month's settlement morning. ``TMF00``
-    closes at 13:45 (29 min left). ``TM0000`` closes at 13:30 (14 min),
-    which is inside ``MIN_MINUTES_LEFT_FOR_RESTART``. The parent gate
-    uses the order symbol, so the child must not boot.
+    2026-11-18 13:26 TPE is that month's settlement morning. ``TMF00``
+    closes at 13:45 (19 min left, still above the gate). ``TM0000``
+    closes at 13:30 (4 min), which the parent gate already refuses.
+    The child must not boot.
     """
     import src.live.headless_app as ha
     import src.live.live_runner as live_runner
     from src.market_data.kline_config import resolve_order_symbol
 
-    fixed = datetime(2026, 11, 18, 13, 16, tzinfo=TPE)
+    fixed = datetime(2026, 11, 18, 13, 26, tzinfo=TPE)
     monkeypatch.setattr(live_runner, "_taipei_now", lambda: fixed)
     assert resolve_order_symbol("TMF00") == "TM0000"
-    quote_left = live_runner.minutes_until_session_close("TMF00")
-    order_left = live_runner.minutes_until_session_close("TM0000")
-    assert quote_left > dr.MIN_MINUTES_LEFT_FOR_RESTART
-    assert order_left <= dr.MIN_MINUTES_LEFT_FOR_RESTART
+    assert live_runner.minutes_until_session_close("TMF00") == 19
+    assert live_runner.minutes_until_session_close("TM0000") == 4
+    assert 19 > dr.MIN_MINUTES_LEFT_FOR_RESTART
+    assert 4 <= dr.MIN_MINUTES_LEFT_FOR_RESTART
 
     _patch_project(monkeypatch, tmp_path)
     discord = _Discord()
@@ -1190,6 +1190,50 @@ def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
     assert f"after {int(clock['t'])}s" in detail
     assert _pending(bot_dir)["pending_notify"] is False
     assert _pending(bot_dir)["session_key"] == SESSION
+
+
+def test_stalling_still_waiting_flush_does_not_delay_boot(
+        tmp_path, monkeypatch):
+    """The old pid dies 0.25s after the 60s miss. A flush must not hold boot."""
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    clock = {"t": 0.0}
+    sent = []
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+
+    class _Note:
+        enabled = True
+
+        def degraded_restart_still_waiting(self, **kwargs):
+            sent.append(kwargs)
+
+        def flush(self, timeout_s=5.0):
+            clock["t"] += 2.0
+            return False
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(
+        LiveRunner, "_pid_alive",
+        staticmethod(lambda _pid: clock["t"] <= dr.PID_WAIT_S))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close",
+        lambda *_a, **_k: dr.MIN_MINUTES_LEFT_FOR_RESTART + 10)
+    monkeypatch.setattr(rb, "_discord", _Note())
+    booted = {}
+
+    def _boot(*_a, **_k):
+        booted["t"] = clock["t"]
+        return None, EXIT_LOGIN
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    args, _bot = _deploy_args(tmp_path, wait_for_pid=77)
+    run_deploy(args)
+    assert sent
+    assert booted["t"] < dr.PID_WAIT_S + 1
 
 
 def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch, capsys):
@@ -1391,7 +1435,9 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert _pending(bot_dir)["pending_notify"] is False
     assert "discord flush True" in capsys.readouterr().out
     from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
-    assert timeouts == [FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S]
+    # Still-waiting is queued and not flushed. The give-up flush
+    # waits that send out too.
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S]
 
     sent.clear()
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
@@ -1408,8 +1454,7 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert _pending(bot_dir)["pending_notify"] is False
     assert _pending(bot_dir)["session_key"] == SESSION
     assert "discord flush True" in capsys.readouterr().out
-    assert timeouts == [
-        FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S]
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S]
 
 
 def test_empty_discord_settings_log_and_still_clear_pending(tmp_path, monkeypatch, capsys):

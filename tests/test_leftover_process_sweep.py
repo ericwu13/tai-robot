@@ -105,7 +105,8 @@ def test_unknown_command_says_unknown_and_a_live_path_is_named(tmp_path):
             7, "python.exe", "python.exe run_bot_cli.py deploy", 1.0)],
         now=lambda: 50.0,
     )
-    assert alerts == ["leftover process pid=7 image=python.exe bot_dir=unknown"]
+    # A deploy that names no bot dir has no ``.lock`` pid to differ from.
+    assert alerts == []
 
 
 def test_process_list_failure_does_not_alert_or_retry_immediately(tmp_path):
@@ -164,6 +165,109 @@ def test_sweep_without_a_lister_is_a_no_op_off_windows(tmp_path):
     sweep_leftover_processes(str(tmp_path / "bot"), alert_fn=alerts.append)
     assert alerts == []
     assert list(tmp_path.glob("leftover_sweep.json")) == []
+
+
+_OLD = 1.0
+_NOW = 10_000.0
+_DEPLOY = "python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2"
+
+
+def _alerts_for(tmp_path, proc, now=_NOW):
+    root = tmp_path / "live"
+    watcher = root / "watcher"
+    watcher.mkdir(parents=True, exist_ok=True)
+    alerts = []
+    sweep_leftover_processes(
+        str(watcher), alert_fn=alerts.append,
+        list_processes=lambda: [proc], now=lambda: now)
+    return alerts
+
+
+def test_sweep_skips_this_process(tmp_path):
+    proc = _proc(os.getpid(), "python.exe", _DEPLOY, _OLD)
+    assert _alerts_for(tmp_path, proc) == []
+
+
+def test_sweep_skips_a_wait_for_pid_waiter(tmp_path):
+    proc = _proc(
+        4201, "python.exe",
+        "python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2 "
+        "--wait-for-pid 91",
+        _OLD)
+    assert _alerts_for(tmp_path, proc) == []
+
+
+def test_sweep_skips_gui_exe_with_no_args(tmp_path):
+    proc = _proc(4202, "tai_backtest.exe", "tai_backtest.exe", _OLD)
+    assert _alerts_for(tmp_path, proc) == []
+
+
+def test_sweep_skips_status_command(tmp_path):
+    proc = _proc(
+        4203, "python.exe",
+        "python.exe run_bot_cli.py status --symbol MXF00 --bot night2", _OLD)
+    assert _alerts_for(tmp_path, proc) == []
+
+
+def test_sweep_skips_backtest_command(tmp_path):
+    proc = _proc(
+        4204, "python.exe", "python.exe run_backtest.py backtest", _OLD)
+    assert _alerts_for(tmp_path, proc) == []
+
+
+def test_sweep_skips_empty_or_unreadable_command_line(tmp_path):
+    assert _alerts_for(tmp_path, _proc(4205, "tai_backtest.exe", "", _OLD)) == []
+    assert _alerts_for(
+        tmp_path, _proc(4206, "python.exe", None, _OLD), now=_NOW + 1000) == []
+
+
+def test_sweep_skips_a_deploy_younger_than_lock_acquire(tmp_path):
+    from src.live.leftover_sweep import LOCK_ACQUIRE_WINDOW_S
+    now = 5_000.0
+    proc = _proc(4207, "python.exe", _DEPLOY, now - 10)
+    assert 10 < LOCK_ACQUIRE_WINDOW_S
+    assert _alerts_for(tmp_path, proc, now=now) == []
+
+
+def test_failed_stamp_write_does_not_realert_inside_the_window(tmp_path, monkeypatch):
+    import src.live.leftover_sweep as mod
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(mod, "_save_stamp", _boom)
+    proc = _proc(4208, "python.exe", _DEPLOY, _OLD)
+    root = tmp_path / "live"
+    watcher = root / "watcher"
+    watcher.mkdir(parents=True)
+    alerts, calls, clock = [], {"n": 0}, {"t": _NOW}
+
+    def listing():
+        calls["n"] += 1
+        return [proc]
+
+    def sweep():
+        mod.sweep_leftover_processes(
+            str(watcher), alert_fn=alerts.append, list_processes=listing,
+            now=lambda: clock["t"])
+
+    sweep()
+    assert len(alerts) == 1
+    clock["t"] += 2
+    sweep()
+    assert calls["n"] == 1
+    assert len(alerts) == 1
+
+
+def test_hang_watchdog_poll_calls_the_leftover_sweep():
+    from src.live.main_heartbeat import HangWatchdog
+    assert "_sweep_leftovers(" in inspect.getsource(HangWatchdog._poll)
+
+
+def test_lock_read_uses_open_shared():
+    from src.live.leftover_sweep import _lock_pid
+    src = inspect.getsource(_lock_pid)
+    assert "open_shared" in src
 
 
 def test_parse_cim_process_json_accepts_one_object_or_a_list():

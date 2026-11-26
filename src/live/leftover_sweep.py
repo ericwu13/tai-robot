@@ -16,12 +16,17 @@ import time
 
 from src.paths import skips_gui_and_com
 from src.utils.file_lock import _lock_nb, _open_lock_fd, _unlock_fd
+from src.utils.fileio import open_shared
 from .host_stall import deploy_root
 
 logger = logging.getLogger(__name__)
 LEFTOVER_SWEEP_INTERVAL_S = 300.0
+# Login 90s + account 20s + pre-deploy OpenInterest gap, retry, and snapshot.
+LOCK_ACQUIRE_WINDOW_S = 125.0
 STAMP_FILENAME = "leftover_sweep.json"
 LOCK_FILENAME = ".leftover_sweep.lock"
+# root -> clock of the last scan, so a failed stamp write still waits 300s.
+_scan_noted: dict[str, float] = {}
 _LIST_TIMEOUT_S = 15
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _PS = (
@@ -29,8 +34,6 @@ _PS = (
     "\"Name='tai_backtest.exe' or Name='python.exe' or Name='pythonw.exe'\" "
     "| Select ProcessId,Name,CommandLine,CreationDate | ConvertTo-Json -Compress"
 )
-_PYTHON = frozenset({"python.exe", "pythonw.exe"})
-_SCRIPTS = ("run_bot_cli.py", "run_backtest.py")
 _LIVE_DIR = re.compile(r"data[/\\]+live[/\\]+([^/\\\"'\s]+)", re.IGNORECASE)
 _CIM_DATE = re.compile(r"/Date\((-?\d+)")
 
@@ -96,8 +99,7 @@ def _sweep(bot_dir, *, alert_fn, list_processes, now, log_fn) -> None:
     if not root:
         return
     path, clock = os.path.join(root, STAMP_FILENAME), float(now())
-    last, keys = _load_stamp(path)
-    if last is not None and clock - last < LEFTOVER_SWEEP_INTERVAL_S:
+    if _window_open(root, clock) or _stamp_fresh(_load_stamp(path)[0], clock):
         return
     fd = _try_lock(os.path.join(root, LOCK_FILENAME))
     if fd is None:
@@ -105,10 +107,11 @@ def _sweep(bot_dir, *, alert_fn, list_processes, now, log_fn) -> None:
     try:
         current = float(now())
         last, keys = _load_stamp(path)
-        if last is not None and current - last < LEFTOVER_SWEEP_INTERVAL_S:
+        if _window_open(root, current) or _stamp_fresh(last, current):
             return
+        _scan_noted[os.path.abspath(root)] = current
         try:
-            lock_pids, processes = _lock_pids(root), list(list_processes())
+            processes = list(list_processes())
         except (OSError, ValueError):
             logger.warning("leftover sweep process list skipped")
             _save_stamp(path, current, keys)
@@ -119,8 +122,10 @@ def _sweep(bot_dir, *, alert_fn, list_processes, now, log_fn) -> None:
                 pid = int(proc.pid)
             except (TypeError, ValueError):
                 continue
-            key = (pid, _created(getattr(proc, "created_at", None)))
-            if pid <= 0 or pid in lock_pids or key in seen or not _is_leftover(proc):
+            created = _created(getattr(proc, "created_at", None))
+            key = (pid, created)
+            if (pid <= 0 or key in seen
+                    or not _reportable(proc, root, pid, created, current)):
                 continue
             where = _bot_dir_for_command(getattr(proc, "command_line", None), root)
             image = os.path.basename(str(getattr(proc, "image", "") or ""))
@@ -136,9 +141,21 @@ def _sweep(bot_dir, *, alert_fn, list_processes, now, log_fn) -> None:
                     logger.exception("leftover sweep notify failed")
             seen.add(key)
             keys.append(key)
-        _save_stamp(path, current, keys)
+        try:
+            _save_stamp(path, current, keys)
+        except OSError:
+            logger.warning("leftover sweep stamp skipped")
     finally:
         _release(fd)
+
+
+def _window_open(root, now) -> bool:
+    last = _scan_noted.get(os.path.abspath(root))
+    return _stamp_fresh(last, now)
+
+
+def _stamp_fresh(last, now) -> bool:
+    return last is not None and now - last < LEFTOVER_SWEEP_INTERVAL_S
 
 
 def _load_stamp(path):
@@ -196,20 +213,64 @@ def _release(fd) -> None:
             pass
 
 
-def _lock_pids(root: str) -> set[int]:
-    """Pid text in each bot ``.lock``. Does not delete a stale lock."""
-    pids = set()
-    for entry in os.scandir(root):
-        if not entry.is_dir():
-            continue
-        try:
-            with open(os.path.join(entry.path, ".lock"), encoding="utf-8") as handle:
-                pid = int(handle.read().strip())
-        except (OSError, ValueError):
-            continue
-        if pid > 0:
-            pids.add(pid)
-    return pids
+def _lock_pid(bot_dir: str):
+    """Pid text in ``bot_dir/.lock``, via a share-delete read. None if absent."""
+    try:
+        with open_shared(os.path.join(bot_dir, ".lock")) as handle:
+            pid = int(handle.read().decode("utf-8", "replace").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _reportable(proc, root, pid, created, now) -> bool:
+    """A deploy whose bot ``.lock`` is missing or names a different pid.
+
+    This process, a ``--wait-for-pid`` waiter, a GUI or non-deploy command,
+    an empty command line, and a deploy younger than lock acquisition
+    are not leftovers.
+    """
+    if pid == os.getpid():
+        return False
+    command = getattr(proc, "command_line", None)
+    if command is None or not str(command).strip():
+        return False
+    argv = _argv(str(command))
+    try:
+        if skips_gui_and_com(argv):
+            return False
+    except Exception:
+        pass
+    if any(token == "--wait-for-pid" or token.startswith("--wait-for-pid=")
+           for token in argv):
+        return False
+    if "deploy" not in argv:
+        return False
+    if _too_young(created, now):
+        return False
+    bot_dir = _bot_dir_for_command(command, root)
+    if not bot_dir:
+        return False
+    owner = _lock_pid(bot_dir)
+    if owner == pid:
+        return False
+    if owner is None:
+        return _age(created, now) is not None and not _too_young(created, now)
+    return True
+
+
+def _age(created, now):
+    if created is None:
+        return None
+    try:
+        return now - float(created)
+    except (TypeError, ValueError):
+        return None
+
+
+def _too_young(created, now) -> bool:
+    age = _age(created, now)
+    return age is not None and age < LOCK_ACQUIRE_WINDOW_S
 
 
 def _argv(command: str) -> list[str]:
@@ -217,21 +278,6 @@ def _argv(command: str) -> list[str]:
         return shlex.split(command, posix=(os.name != "nt"))
     except ValueError:
         return command.split()
-
-
-def _is_leftover(proc) -> bool:
-    image = os.path.basename(str(getattr(proc, "image", "") or "")).lower()
-    command = getattr(proc, "command_line", None)
-    argv = _argv(str(command)) if command else []
-    try:
-        if argv and skips_gui_and_com(argv):
-            return False
-    except Exception:
-        pass
-    if image == "tai_backtest.exe":
-        return True
-    text = str(command or "")
-    return image in _PYTHON and any(s in text.lower() for s in _SCRIPTS) and "deploy" in argv
 
 
 def _bot_dir_for_command(command, root: str):

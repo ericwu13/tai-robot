@@ -725,7 +725,8 @@ def _emit_restart_still_waiting(old_pid: int, waited_s: float, *,
     """Priority "still waiting" alert. Does not clear ``pending_notify``.
 
     Distinct from ``_emit_restart_failed`` so operators can tell a live
-    wait from a give-up. Flushed with the same helper as the failure alert.
+    wait from a give-up. The worker sends it. This path does not flush:
+    a stall here used to hold the poll after the old pid had already exited.
     ``order_symbol`` is the close the continued wait will measure.
     """
     order = f" order={order_symbol}" if order_symbol else ""
@@ -746,8 +747,6 @@ def _emit_restart_still_waiting(old_pid: int, waited_s: float, *,
                 f"pid {old_pid} after {int(waited_s)}s",
                 priority=True,
             )
-        from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
-        _log_discord_flush(discord, FLUSH_EXIT_TIMEOUT_S)
     except Exception as exc:
         rb._safe_log(f"[HEADLESS] still-waiting alert failed: "
                      f"[{type(exc).__name__}] {exc}")
