@@ -671,7 +671,16 @@ class LiveRunner:
             f.write(str(os.getpid()))
 
     def release_lock(self) -> None:
-        """Remove lock file."""
+        """Remove the lock file. Leave ``.exiting`` for the watchdog.
+
+        The marker is written before the lock is removed and is never
+        deleted on this path. A hang after atexit must stay visible.
+        """
+        try:
+            from src.live.leftover_sweep import write_exiting_marker
+            write_exiting_marker(self.bot_dir)
+        except Exception:
+            pass
         try:
             os.remove(self._lock_path)
         except OSError:

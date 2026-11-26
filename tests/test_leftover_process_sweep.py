@@ -1,297 +1,171 @@
-"""Leftover deploy processes are reported, never stopped."""
+"""`.exiting` is written when the lock is released and cleared only by the watchdog."""
 
 from __future__ import annotations
 
 import inspect
+import json
 import os
-from types import SimpleNamespace
 
 import pytest
 
 from src.live.leftover_sweep import (
-    LEFTOVER_SWEEP_INTERVAL_S,
-    _bot_dir_for_command,
-    sweep_leftover_processes,
+    EXITING_ALERT_AFTER_S,
+    EXITING_FILENAME,
+    EXITING_SCAN_INTERVAL_S,
+    check_exiting_markers,
+    write_exiting_marker,
 )
+from src.live.live_runner import LiveRunner
+from tests.test_live_runner import NeverTradeStrategy
+
+_CREATED = 100.0
 
 
-def _proc(pid, image, command, created):
-    return SimpleNamespace(
-        pid=pid, image=image, command_line=command, created_at=created)
-
-
-def test_sweep_alerts_the_unlocked_pid_once(tmp_path):
-    assert LEFTOVER_SWEEP_INTERVAL_S == 300
-    root = tmp_path / "live"
-    owned = root / "TMF00_owned"
-    owned.mkdir(parents=True)
-    (owned / ".lock").write_text("4101\n", encoding="utf-8")
-    watcher = root / "TMF00_watcher"
-    watcher.mkdir()
-    procs = [
-        _proc(4101, "python.exe",
-              "python.exe run_bot_cli.py deploy --symbol TMF00 --bot owned",
-              10.0),
-        _proc(4102, "python.exe",
-              "python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2",
-              20.0),
-        _proc(4103, "python.exe",
-              "python.exe run_backtest.py deploy --grid-subprocess-smoke",
-              30.0),
-    ]
-    calls = {"n": 0}
-
-    def list_processes():
-        calls["n"] += 1
-        return list(procs)
-
-    alerts = []
-    clock = {"t": 1000.0}
-
-    def sweep():
-        sweep_leftover_processes(
-            str(watcher),
-            alert_fn=alerts.append,
-            list_processes=list_processes,
-            now=lambda: clock["t"],
-        )
-
-    sweep()
-    assert calls["n"] == 1
-    assert len(alerts) == 1
-    assert "leftover process" in alerts[0]
-    assert "pid=4102" in alerts[0]
-    assert "python.exe" in alerts[0]
-    assert "MXF00_night2" in alerts[0]
-    assert "4101" not in alerts[0]
-    assert "4103" not in alerts[0]
-    assert (owned / ".lock").read_text(encoding="utf-8").strip() == "4101"
-
-    clock["t"] = 1000.0 + LEFTOVER_SWEEP_INTERVAL_S - 1
-    sweep()
-    assert calls["n"] == 1
-    assert len(alerts) == 1
-
-    clock["t"] = 1000.0 + LEFTOVER_SWEEP_INTERVAL_S
-    sweep()
-    assert calls["n"] == 2
-    assert len(alerts) == 1
-
-    procs[1].created_at = 99.0
-    clock["t"] += LEFTOVER_SWEEP_INTERVAL_S
-    sweep()
-    assert calls["n"] == 3
-    assert len(alerts) == 2
-    assert "pid=4102" in alerts[1]
-
-
-def test_unknown_command_says_unknown_and_a_live_path_is_named(tmp_path):
-    root = str(tmp_path)
-    assert _bot_dir_for_command(
-        "python run_bot_cli.py deploy --symbol TX00 --bot night", root,
-    ).endswith("TX00_night")
-    assert _bot_dir_for_command(
-        r"C:\apps\data\live\MXF00_night2\cli_stdout.log", root,
-    ).endswith("MXF00_night2")
-    assert _bot_dir_for_command("python run_backtest.py deploy", root) is None
-
-    bot = tmp_path / "live" / "watcher"
-    bot.mkdir(parents=True)
-    alerts = []
-    sweep_leftover_processes(
-        str(bot),
-        alert_fn=alerts.append,
-        list_processes=lambda: [_proc(
-            7, "python.exe", "python.exe run_bot_cli.py deploy", 1.0)],
-        now=lambda: 50.0,
-    )
-    # A deploy that names no bot dir has no ``.lock`` pid to differ from.
-    assert alerts == []
-
-
-def test_process_list_failure_does_not_alert_or_retry_immediately(tmp_path):
-    bot = tmp_path / "live" / "watcher"
-    bot.mkdir(parents=True)
-    alerts = []
-
-    def boom():
-        raise OSError("no snapshot")
-
-    sweep_leftover_processes(
-        str(bot), alert_fn=alerts.append, list_processes=boom, now=lambda: 1.0)
-    assert alerts == []
-    calls = {"n": 0}
-
-    def listing():
-        calls["n"] += 1
-        return []
-
-    sweep_leftover_processes(
-        str(bot), alert_fn=alerts.append, list_processes=listing, now=lambda: 2.0)
-    assert calls["n"] == 0
-    assert alerts == []
-
-
-def test_held_stamp_lock_skips_the_scan(tmp_path):
-    from src.live.host_stall import deploy_root
-    from src.live.leftover_sweep import LOCK_FILENAME
-    from src.utils.file_lock import _lock_nb, _open_lock_fd, _unlock_fd
-
-    bot = tmp_path / "live" / "watcher"
-    bot.mkdir(parents=True)
-    root = deploy_root(str(bot))
-    fd = _open_lock_fd(os.path.join(root, LOCK_FILENAME))
-    assert _lock_nb(fd)
-    alerts = []
-    calls = {"n": 0}
-    try:
-        sweep_leftover_processes(
-            str(bot),
-            alert_fn=alerts.append,
-            list_processes=lambda: calls.__setitem__("n", calls["n"] + 1) or [],
-            now=lambda: 10.0,
-        )
-    finally:
-        _unlock_fd(fd)
-        os.close(fd)
-    assert calls["n"] == 0
-    assert alerts == []
-
-
-def test_sweep_without_a_lister_is_a_no_op_off_windows(tmp_path):
-    if os.name == "nt":
-        pytest.skip("Windows lists real processes")
-    alerts = []
-    sweep_leftover_processes(str(tmp_path / "bot"), alert_fn=alerts.append)
-    assert alerts == []
-    assert list(tmp_path.glob("leftover_sweep.json")) == []
-
-
-_OLD = 1.0
-_NOW = 10_000.0
-_DEPLOY = "python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2"
-
-
-def _alerts_for(tmp_path, proc, now=_NOW):
-    root = tmp_path / "live"
-    watcher = root / "watcher"
-    watcher.mkdir(parents=True, exist_ok=True)
-    alerts = []
-    sweep_leftover_processes(
-        str(watcher), alert_fn=alerts.append,
-        list_processes=lambda: [proc], now=lambda: now)
-    return alerts
-
-
-def test_sweep_skips_this_process(tmp_path):
-    proc = _proc(os.getpid(), "python.exe", _DEPLOY, _OLD)
-    assert _alerts_for(tmp_path, proc) == []
-
-
-def test_sweep_skips_a_wait_for_pid_waiter(tmp_path):
-    proc = _proc(
-        4201, "python.exe",
-        "python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2 "
-        "--wait-for-pid 91",
-        _OLD)
-    assert _alerts_for(tmp_path, proc) == []
-
-
-def test_sweep_skips_gui_exe_with_no_args(tmp_path):
-    proc = _proc(4202, "tai_backtest.exe", "tai_backtest.exe", _OLD)
-    assert _alerts_for(tmp_path, proc) == []
-
-
-def test_sweep_skips_status_command(tmp_path):
-    proc = _proc(
-        4203, "python.exe",
-        "python.exe run_bot_cli.py status --symbol MXF00 --bot night2", _OLD)
-    assert _alerts_for(tmp_path, proc) == []
-
-
-def test_sweep_skips_backtest_command(tmp_path):
-    proc = _proc(
-        4204, "python.exe", "python.exe run_backtest.py backtest", _OLD)
-    assert _alerts_for(tmp_path, proc) == []
-
-
-def test_sweep_skips_empty_or_unreadable_command_line(tmp_path):
-    assert _alerts_for(tmp_path, _proc(4205, "tai_backtest.exe", "", _OLD)) == []
-    assert _alerts_for(
-        tmp_path, _proc(4206, "python.exe", None, _OLD), now=_NOW + 1000) == []
-
-
-def test_sweep_skips_a_deploy_younger_than_lock_acquire(tmp_path):
-    from src.live.leftover_sweep import LOCK_ACQUIRE_WINDOW_S
-    now = 5_000.0
-    proc = _proc(4207, "python.exe", _DEPLOY, now - 10)
-    assert 10 < LOCK_ACQUIRE_WINDOW_S
-    assert _alerts_for(tmp_path, proc, now=now) == []
-
-
-def test_failed_stamp_write_does_not_realert_inside_the_window(tmp_path, monkeypatch):
-    import src.live.leftover_sweep as mod
-
-    def _boom(*_args, **_kwargs):
-        raise OSError("disk full")
-
-    monkeypatch.setattr(mod, "_save_stamp", _boom)
-    proc = _proc(4208, "python.exe", _DEPLOY, _OLD)
+def _layout(tmp_path):
     root = tmp_path / "live"
     watcher = root / "watcher"
     watcher.mkdir(parents=True)
-    alerts, calls, clock = [], {"n": 0}, {"t": _NOW}
+    return root, str(watcher)
 
-    def listing():
-        calls["n"] += 1
-        return [proc]
 
-    def sweep():
-        mod.sweep_leftover_processes(
-            str(watcher), alert_fn=alerts.append, list_processes=listing,
-            now=lambda: clock["t"])
+def _plant(root, name, *, pid=4242, created=_CREATED, written_at=1_000.0,
+           alerted=False):
+    bot = root / name
+    bot.mkdir()
+    path = bot / EXITING_FILENAME
+    path.write_text(json.dumps({
+        "pid": pid, "created_at": created, "written_at": written_at,
+        "alerted": alerted,
+    }), encoding="utf-8")
+    return str(path)
 
-    sweep()
+
+def _check(watcher, now, *, alive, creation=None, alerts=None):
+    check_exiting_markers(
+        watcher, alert_fn=None if alerts is None else alerts.append,
+        now=lambda: now,
+        alive=alive,
+        creation_of=(lambda _pid: _CREATED) if creation is None else creation,
+    )
+
+
+def test_dead_pid_removes_the_marker_without_an_alert(tmp_path):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night")
+    alerts = []
+    _check(watcher, 2_000.0, alive=lambda _pid: False, alerts=alerts)
+    assert alerts == []
+    assert not os.path.isfile(path)
+
+
+def test_reused_pid_removes_the_marker_without_an_alert(tmp_path):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night", created=100.0)
+    alerts = []
+    _check(watcher, 2_000.0, alive=lambda _pid: True,
+           creation=lambda _pid: 999.0, alerts=alerts)
+    assert alerts == []
+    assert not os.path.isfile(path)
+
+
+def test_alive_past_60s_alerts_once(tmp_path):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night", written_at=1_000.0)
+    alerts = []
+    when = 1_000.0 + EXITING_ALERT_AFTER_S + 1
+    _check(watcher, when, alive=lambda _pid: True, alerts=alerts)
     assert len(alerts) == 1
-    clock["t"] += 2
-    sweep()
-    assert calls["n"] == 1
+    assert "pid=4242" in alerts[0]
+    assert "TMF00_night" in alerts[0]
+    assert "age=" in alerts[0]
+    saved = json.loads(open(path, encoding="utf-8").read())
+    assert saved["alerted"] is True
+    _check(watcher, when + 2, alive=lambda _pid: True, alerts=alerts)
+    _check(watcher, when + EXITING_SCAN_INTERVAL_S + 1,
+           alive=lambda _pid: True, alerts=alerts)
     assert len(alerts) == 1
+    assert os.path.isfile(path)
+
+
+def test_alive_under_60s_does_not_alert(tmp_path):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night", written_at=1_000.0)
+    alerts = []
+    _check(watcher, 1_000.0 + EXITING_ALERT_AFTER_S - 1,
+           alive=lambda _pid: True, alerts=alerts)
+    assert alerts == []
+    assert os.path.isfile(path)
+
+
+def test_corrupt_marker_is_deleted_with_one_log(tmp_path, caplog):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write("{not json")
+    alerts = []
+    with caplog.at_level("WARNING"):
+        _check(watcher, 2_000.0, alive=lambda _pid: True, alerts=alerts)
+    assert alerts == []
+    assert not os.path.isfile(path)
+    assert sum("unreadable" in rec.message for rec in caplog.records) == 1
+
+
+def test_release_lock_writes_exiting_on_the_lock_release_path(tmp_path, monkeypatch):
+    runner = LiveRunner(
+        NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="TestBot")
+    runner.acquire_lock()
+    marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
+    present = {}
+    real_remove = os.remove
+
+    def spy_remove(path):
+        if path == runner._lock_path:
+            present["before_unlock"] = os.path.isfile(marker)
+        real_remove(path)
+
+    monkeypatch.setattr(os, "remove", spy_remove)
+    runner.release_lock()
+    assert present["before_unlock"] is True
+    assert not os.path.isfile(runner._lock_path)
+    assert os.path.isfile(marker)
+    data = json.loads(open(marker, encoding="utf-8").read())
+    assert data["pid"] == os.getpid()
+    assert data["created_at"]
+    assert data["written_at"]
+    assert "release_lock" in inspect.getsource(LiveRunner.stop)
+
+
+def test_exiting_process_never_deletes_the_marker(tmp_path):
+    runner = LiveRunner(
+        NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="TestBot")
+    runner.acquire_lock()
+    runner.release_lock()
+    marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
+    runner.release_lock()
+    from run_backtest import note_return_from_main
+    note_return_from_main()
+    assert os.path.isfile(marker)
+    assert "os.remove" not in inspect.getsource(write_exiting_marker)
+    assert inspect.getsource(LiveRunner.release_lock).count("os.remove") == 1
+
+
+def test_default_liveness_removes_a_dead_pid_without_an_alert(tmp_path):
+    root, watcher = _layout(tmp_path)
+    path = _plant(root, "TMF00_night", pid=2**30, written_at=1.0)
+    alerts = []
+    check_exiting_markers(
+        watcher, alert_fn=alerts.append, now=lambda: 10_000.0)
+    assert alerts == []
+    assert not os.path.isfile(path)
+
+
+def test_exiting_check_has_no_kill_api():
+    import src.live.leftover_sweep as mod
+    src = inspect.getsource(mod)
+    assert "TerminateProcess" not in src
+    assert "os.kill" not in src
 
 
 def test_hang_watchdog_poll_calls_the_leftover_sweep():
     from src.live.main_heartbeat import HangWatchdog
     assert "_sweep_leftovers(" in inspect.getsource(HangWatchdog._poll)
-
-
-def test_lock_read_uses_open_shared():
-    from src.live.leftover_sweep import _lock_pid
-    src = inspect.getsource(_lock_pid)
-    assert "open_shared" in src
-
-
-def test_parse_cim_process_json_accepts_one_object_or_a_list():
-    from src.live.leftover_sweep import parse_cim_process_json
-
-    one = (
-        '{"ProcessId":7,"Name":"python.exe",'
-        '"CommandLine":"python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2",'
-        '"CreationDate":"/Date(1700000000000)/"}'
-    )
-    parsed = parse_cim_process_json(one)
-    assert len(parsed) == 1
-    assert parsed[0].pid == 7 and parsed[0].image == "python.exe"
-    assert parsed[0].created_at == 1700000000.0
-    assert "deploy" in parsed[0].command_line
-    both = "[" + one + "," + one.replace('"ProcessId":7', '"ProcessId":8') + "]"
-    assert [proc.pid for proc in parse_cim_process_json(both)] == [7, 8]
-    assert parse_cim_process_json("  ") == []
-
-
-def test_leftover_sweep_source_has_no_stop_api():
-    import src.live.leftover_sweep as mod
-
-    src = inspect.getsource(mod)
-    assert "TerminateProcess" not in src
-    assert "os.kill" not in src
-    assert "kill" not in inspect.signature(sweep_leftover_processes).parameters

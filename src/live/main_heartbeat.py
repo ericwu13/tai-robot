@@ -697,9 +697,8 @@ class HangWatchdog:
     def _sweep_leftovers(self) -> None:
         """Detection-only leftover scan. A failure here is not a hang."""
         try:
-            from src.live.leftover_sweep import sweep_leftover_processes
-            sweep_leftover_processes(
-                self.bot_dir, alert_fn=self._emit_alert)
+            from src.live.leftover_sweep import check_exiting_markers
+            check_exiting_markers(self.bot_dir, alert_fn=self._emit_alert)
         except Exception:
             logger.exception("leftover sweep failed")
 
