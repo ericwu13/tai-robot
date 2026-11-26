@@ -1374,34 +1374,54 @@ def test_flush_false_is_logged_and_restart_failed_uses_the_long_cap(
     assert note.timeouts == [FLUSH_EXIT_TIMEOUT_S]
 
 
-def test_long_flush_runs_before_spawn_and_post_spawn_flush_is_five_seconds(
+def test_spawn_runs_before_the_only_flush_and_that_flush_is_five_seconds(
         tmp_path, monkeypatch):
-    """The child is not alive during the long flush. After spawn, 5s only."""
+    """A stalling flush must not run until the replacement has been spawned."""
+    import threading
+
     import src.live.headless_app as ha
-    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
 
     order = []
-    note = _FlushNote()
-
-    def _flush(timeout_s=5.0):
-        order.append(("flush", timeout_s))
-        return True
+    entered = threading.Event()
+    release = threading.Event()
 
     def _spawn(*_a, **_k):
         order.append("spawn")
         return SimpleNamespace(pid=4242)
 
+    def _flush(timeout_s=5.0):
+        order.append(("enter", timeout_s))
+        entered.set()
+        release.wait(2)
+        order.append(("flush", timeout_s))
+        return True
+
+    note = _FlushNote()
     note.flush = _flush
     monkeypatch.setattr(rb, "_discord", note)
-    monkeypatch.setattr(rb, "_faulthandler_log", None)
-    monkeypatch.setattr(rb, "_exit_dump_skip_logged", False)
     monkeypatch.setattr(ha, "spawn_detached", _spawn)
     driver = SimpleNamespace(
         _pending_restart_cmd=["tai", "deploy"], bot_dir=str(tmp_path),
         args=SimpleNamespace(symbol="TMF00"))
-    assert ha._spawn_pending_restart(driver, 0) == 0
-    assert order == [
-        ("flush", FLUSH_EXIT_TIMEOUT_S), "spawn", ("flush", 5.0)]
+    box = {}
+
+    def _run():
+        try:
+            box["code"] = ha._spawn_pending_restart(driver, 0)
+        except Exception as exc:
+            box["err"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert order == ["spawn", ("enter", 5.0)]
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert box.get("err") is None and box.get("code") == 0
+    assert [item for item in order if item[0] == "flush"] == [("flush", 5.0)]
 
 
 def test_discord_warning_reaches_stdout_before_pid_wait(
