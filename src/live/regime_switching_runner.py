@@ -1038,6 +1038,11 @@ class RegimeSwitchingRunner(LiveRunner):
 
             report_key = f"{session_date}_{session_type}"
             if report_key == self._last_report_key:
+                if getattr(self, "_report_skip_logged", None) != (report_key, "sent"):
+                    self._report_skip_logged = (report_key, "sent")
+                    logger.info(
+                        "daily report skipped: key %s already sent (bot=%s)",
+                        report_key, self.bot_name)
                 return
 
             report = generate_session_report(
@@ -1054,6 +1059,11 @@ class RegimeSwitchingRunner(LiveRunner):
                 session_close_dt=close_dt_str,
             )
             if report is None:
+                if getattr(self, "_report_skip_logged", None) != (report_key, "no_trades"):
+                    self._report_skip_logged = (report_key, "no_trades")
+                    logger.info(
+                        "daily report not generated: no completed trades for key %s (bot=%s)",
+                        report_key, self.bot_name)
                 return
             self._last_report_key = report_key
             report["regime_switching"] = {

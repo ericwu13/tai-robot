@@ -433,6 +433,18 @@ class DeployDriver(_Driver):
             self._restart_policy = policy
         return policy
 
+    def _log_restart_outcome(self, outcome) -> None:
+        """One line per outcome change. A steady not-degraded poll is silent."""
+        key = (type(outcome).__name__, str(getattr(outcome, "reason", "")))
+        if key == ("Noop", "not_degraded"):
+            self._restart_logged = None
+            return
+        if key == getattr(self, "_restart_logged", None):
+            return
+        self._restart_logged = key
+        rb._log(f"[HEADLESS] degraded-restart policy: {key[0]}/{key[1]} "
+                f"mode={getattr(self.app, '_trading_mode', '')}")
+
     def _maybe_degraded_restart(self) -> None:
         """One keep-position restart per open session, or one alert."""
         if self.exit_code is not None:
@@ -446,6 +458,8 @@ class DeployDriver(_Driver):
             self._begin_degraded_restart(outcome)
         elif isinstance(outcome, AlertOnly):
             self._alert_restart_skipped(outcome)
+        else:
+            self._log_restart_outcome(outcome)
 
     def _begin_degraded_restart(self, decision: RestartDecision) -> None:
         app = self.app
