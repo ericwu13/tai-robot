@@ -89,6 +89,7 @@ import http.client
 import json
 import logging
 import os
+import re
 import sys
 
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
@@ -203,12 +204,41 @@ def _is_timeout_error(exc) -> bool:
     return "timed out" in str(exc or "").lower()
 
 
+def _content_type(resp) -> str:
+    # Missing headers must not escape: the caller's except Exception would
+    # relabel this failure as kind "error".
+    headers = getattr(resp, "headers", None)
+    try:
+        return headers.get("Content-Type", "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _body_evidence(status, ctype, raw) -> str:
+    b = raw if isinstance(raw, bytes) else raw.encode("utf-8", "replace")
+
+    def visible(data: bytes) -> str:
+        return "".join(
+            chr(x) if 0x20 <= x < 0x7f and x not in (0x22, 0x5c)
+            else f"\\x{x:02x}" for x in data)
+
+    n = len(b)
+    tag = (
+        " html (likely block page)"
+        if b.lstrip(b" \t\r\n\xef\xbb\xbf")[:1] == b"<" else "")
+    escaped = re.sub(r"\d{1,3}(?:\.\d{1,3}){3}", "x.x.x.x", visible(b[:64]))
+    text = ctype if isinstance(ctype, str) else ""
+    shown = visible(text.encode("utf-8", "replace"))[:80] or "?"
+    return f'status={status} ctype={shown} len={n}{tag} prefix="{escaped}"'
+
+
 def _http_json(url: str) -> object | None:
     """GET *url*, parse JSON.
 
     Raises ChipsFetchError on DNS, connection, timeout, any HTTP error
     (4xx and 5xx), a truncated read, a 200 whose body is empty or
     whitespace, or a 200 body that is not JSON (an HTML block page).
+    The message carries status, Content-Type, length and a 64-byte escaped prefix.
     A blank 200 is what a WAF or proxy can return; it is not an empty
     dataset.      Returns a parsed JSON value.  JSON ``null`` is a fetch failure.
     Callers treat TAIFEX ``[]`` and a TWSE object whose ``stat`` is not
@@ -223,6 +253,7 @@ def _http_json(url: str) -> object | None:
             if status is None:
                 status = resp.getcode()
             raw = resp.read()
+            ctype = _content_type(resp)
     except urllib.error.HTTPError as exc:
         raise ChipsFetchError("http", f"HTTP {exc.code}: {exc.reason}") from exc
     except urllib.error.URLError as exc:
@@ -254,7 +285,10 @@ def _http_json(url: str) -> object | None:
         text = raw.decode("utf-8-sig") if isinstance(raw, bytes) else raw
         parsed = json.loads(text)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
-        raise ChipsFetchError("http", f"non-JSON body: {type(exc).__name__}: {exc}") from exc
+        raise ChipsFetchError(
+            "http",
+            f"non-JSON body: {_body_evidence(status, ctype, raw)} "
+            f"({type(exc).__name__}: {exc})") from exc
     if parsed is None:
         raise ChipsFetchError("http", "JSON null")
     return parsed
@@ -744,6 +778,7 @@ def no_data_message(date_key: str | None) -> str:
 
 def _clear_fetch_streak(state: dict) -> None:
     state["fetch_error_streak"] = 0
+    state.pop("last_fetch_error", None)
 
 
 def _abort_fetch(state: dict, now: datetime, spath, base_path: str,
