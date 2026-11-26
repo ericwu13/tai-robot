@@ -191,6 +191,8 @@ jobs:
     permissions:
       contents: read
       issues: write
+    env:
+      GEMINI_APP_ID: ${{ secrets.GEMINI_APP_ID }}
 
     steps:
       - name: Checkout post-processor from master
@@ -206,9 +208,26 @@ jobs:
           name: gemini-triage-${{ needs.triage.outputs.issue_number }}-${{ github.run_id }}
           path: ${{ runner.temp }}/gemini-triage
 
+      # Mint a dedicated GitHub App identity (<app-slug>[bot]) when configured,
+      # matching auto-merge.yml. Falls back cleanly to github.token otherwise.
+      - name: Mint Gemini bot App token
+        id: app-token
+        if: env.GEMINI_APP_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.GEMINI_APP_ID }}
+          private-key: ${{ secrets.GEMINI_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-issues: write
+          permission-metadata: read
+
       - name: Apply validated labels and post triage comment
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           ISSUE: ${{ needs.triage.outputs.issue_number }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

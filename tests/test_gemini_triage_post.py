@@ -224,3 +224,26 @@ class TestWorkflowSecurityInvariants:
         core_tools = set(settings["tools"]["core"])
         assert core_tools <= {"read_file", "read_many_files", "list_directory", "glob", "grep_search"}
         assert not (core_tools & {"run_shell_command", "write_file", "replace", "web_fetch", "google_web_search"})
+
+        # App token minting happens ONLY in apply (never inside the LLM triage job)
+        assert not any(
+            str(s.get("uses", "")).startswith("actions/create-github-app-token@")
+            for s in triage_job["steps"]
+        )
+        app_steps = [
+            s for s in apply_job["steps"]
+            if str(s.get("uses", "")).startswith("actions/create-github-app-token@")
+        ]
+        assert len(app_steps) == 1
+        assert app_steps[0]["with"]["permission-issues"] == "write"
+        assert app_steps[0]["with"]["permission-contents"] == "read"
+
+    def test_app_slug_matches_only_app_owned_comments(self):
+        comments = [
+            {"id": 11, "user": {"login": "github-actions[bot]"}, "body": f"old {mod.MARKER}"},
+            {"id": 22, "user": {"login": "tai-robot-gemini[bot]"}, "body": f"app {mod.MARKER}"},
+        ]
+        assert mod.find_existing_triage_comment_id(comments, app_slug="") == 11
+        assert mod.find_existing_triage_comment_id(comments, app_slug="tai-robot-gemini") == 22
+        # Never attempts to PATCH a github-actions[bot] comment with an App token
+        assert mod.find_existing_triage_comment_id(comments[:1], app_slug="tai-robot-gemini") is None

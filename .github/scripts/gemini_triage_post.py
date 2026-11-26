@@ -253,14 +253,26 @@ def format_triage_comment(
     return summary + footer
 
 
-def find_existing_triage_comment_id(comments: list[Any]) -> int | None:
-    """Return the comment ID of the last bot triage comment carrying MARKER."""
+def actor_logins(app_slug: str = "") -> frozenset[str]:
+    """GitHub login names owned by the current token (App bot or Actions bot)."""
+    slug = str(app_slug or "").strip()
+    if slug:
+        base = slug[:-5] if slug.endswith("[bot]") else slug
+        return frozenset({base, f"{base}[bot]"})
+    return BOT_LOGINS
+
+
+def find_existing_triage_comment_id(
+    comments: list[Any], *, app_slug: str = ""
+) -> int | None:
+    """Return the comment ID of the last triage comment owned by the current actor."""
+    owners = actor_logins(app_slug)
     for item in reversed(comments or []):
         if not isinstance(item, dict):
             continue
         login = str((item.get("user") or {}).get("login") or "")
         body = str(item.get("body") or "")
-        if login in BOT_LOGINS and MARKER in body and isinstance(item.get("id"), int):
+        if login in owners and MARKER in body and isinstance(item.get("id"), int):
             return item["id"]
     return None
 
@@ -271,6 +283,7 @@ def apply_triage(
     result_path: str | os.PathLike,
     *,
     run_url: str = "",
+    app_slug: str = "",
 ) -> dict[str, Any]:
     raw_text = Path(result_path).read_text(encoding="utf-8")
     data = extract_json_object(raw_text)
@@ -308,7 +321,7 @@ def apply_triage(
         )
 
     comments = gh_api(f"repos/{repo}/issues/{issue_num}/comments?per_page=100") or []
-    existing_id = find_existing_triage_comment_id(comments)
+    existing_id = find_existing_triage_comment_id(comments, app_slug=app_slug)
     if existing_id is not None:
         gh_api(
             f"repos/{repo}/issues/comments/{existing_id}",
@@ -342,7 +355,13 @@ def main(argv: list[str] | None = None) -> int:
     if cmd == "collect":
         collect_context(repo, issue_num, path)
     else:
-        apply_triage(repo, issue_num, path, run_url=os.environ.get("RUN_URL", "").strip())
+        apply_triage(
+            repo,
+            issue_num,
+            path,
+            run_url=os.environ.get("RUN_URL", "").strip(),
+            app_slug=os.environ.get("APP_SLUG", "").strip(),
+        )
     return 0
 
 
