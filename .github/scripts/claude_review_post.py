@@ -72,23 +72,46 @@ BOT_LOGINS = {"github-actions", "github-actions[bot]"}
 DISCORD_LIMIT = 2000
 
 
+def _read_slug(app_slug):
+    if app_slug is None:
+        raw = os.environ.get("APP_SLUG", "")
+    else:
+        raw = str(app_slug or "")
+    return raw.strip()
+
+
+def _as_bot_login(name):
+    """`{base}[bot]`. APP_SLUG is a bare claimable username and is never returned."""
+    name = (name or "").strip()
+    if name.endswith("[bot]"):
+        name = name[:-5].strip()
+    if not name or "[" in name or "]" in name:
+        return ""
+    return f"{name}[bot]"
+
+
+def _actions_bot_logins():
+    """Actions logins already in `[bot]` form. A bare listed login is dropped."""
+    return {n for n in BOT_LOGINS if n == _as_bot_login(n)}
+
+
 def bot_logins(app_slug=None):
-    """All logins recognized as Claude reviews (legacy Actions bot + App bot)."""
-    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
-    logins = set(BOT_LOGINS)
-    if slug:
-        base = slug[:-5] if slug.endswith("[bot]") else slug
-        logins.update({base, f"{base}[bot]"})
+    """Claude authors: `[bot]` Actions logins, plus the app only as `{slug}[bot]`."""
+    logins = _actions_bot_logins()
+    app = _as_bot_login(_read_slug(app_slug))
+    if app:
+        logins.add(app)
     return logins
 
 
 def actor_logins(app_slug=None):
     """Logins owned by the current token (only these comments can be PATCHed)."""
-    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
-    if slug:
-        base = slug[:-5] if slug.endswith("[bot]") else slug
-        return {base, f"{base}[bot]"}
-    return set(BOT_LOGINS)
+    slug = _read_slug(app_slug)
+    if not slug:
+        return _actions_bot_logins()
+    app = _as_bot_login(slug)
+    return {app} if app else set()
+
 
 THREADS_QUERY = """
 query($owner:String!, $name:String!, $pr:Int!, $after:String) {
