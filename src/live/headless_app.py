@@ -720,15 +720,18 @@ def _flush_discord(discord) -> None:
 
 
 def _emit_restart_still_waiting(old_pid: int, waited_s: float, *,
-                                bot: str = "", symbol: str = "") -> None:
+                                bot: str = "", symbol: str = "",
+                                order_symbol: str = "") -> None:
     """Priority "still waiting" alert. Does not clear ``pending_notify``.
 
     Distinct from ``_emit_restart_failed`` so operators can tell a live
     wait from a give-up. Flushed with the same helper as the failure alert.
+    ``order_symbol`` is the close the continued wait will measure.
     """
+    order = f" order={order_symbol}" if order_symbol else ""
     rb._safe_log(
         f"[HEADLESS] pid-wait still waiting old={old_pid} "
-        f"after {int(waited_s)}s symbol={symbol}"
+        f"after {int(waited_s)}s symbol={symbol}{order}"
     )
     discord = _resolve_discord(bot=bot, symbol=symbol)
     if discord is None or not getattr(discord, "enabled", False):
@@ -833,29 +836,33 @@ def run_deploy(args) -> int:
         # Before _boot, so a pid-wait warning is on stdout. Deploy's
         # own attach runs only after the wait succeeds.
         rb.attach_app_log_handlers()
+        started = time.monotonic()
         rb._safe_log(f"[HEADLESS] pid-wait start old={old_pid}")
         # The 60s primitive stays. A miss does not give up and does not
         # clear pending_notify: the recovery line still has to fire if
         # this process later reaches tick subscription.
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
-            _emit_restart_still_waiting(
-                old_pid, PID_WAIT_S, bot=bot_name, symbol=symbol)
             # Same symbol observe_app uses (watchdog.order_symbol).
             # TMF00 keeps a 13:45 close; its order symbol TM0000
             # settles at 13:30.
             from src.market_data.kline_config import resolve_order_symbol
             order_symbol = resolve_order_symbol(symbol) if symbol else symbol
+            _emit_restart_still_waiting(
+                old_pid, PID_WAIT_S, bot=bot_name, symbol=symbol,
+                order_symbol=order_symbol)
             outcome, mins_left = poll_old_pid_until_exit_or_budget(
                 old_pid, order_symbol)
             if outcome == "budget":
+                waited_s = max(0.0, time.monotonic() - started)
                 rb._safe_log(
                     f"[HEADLESS] pid-wait budget gone old={old_pid} "
-                    f"symbol={symbol} order={order_symbol} mins_left={mins_left}"
+                    f"symbol={symbol} order={order_symbol} "
+                    f"mins_left={mins_left} waited={int(waited_s)}s"
                 )
                 _emit_restart_failed(
                     "old process still alive",
                     detail=(f"pid {old_pid} still alive after "
-                            f"{int(PID_WAIT_S)}s"),
+                            f"{int(waited_s)}s order={order_symbol}"),
                     bot=bot_name,
                     symbol=symbol,
                 )

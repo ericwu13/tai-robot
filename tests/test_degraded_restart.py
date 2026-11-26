@@ -1163,6 +1163,8 @@ def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
     assert order_left <= dr.MIN_MINUTES_LEFT_FOR_RESTART
 
     _patch_project(monkeypatch, tmp_path)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
     clock = {"t": 0.0}
 
     def _sleep(seconds):
@@ -1183,6 +1185,9 @@ def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
     code = run_deploy(args)
     assert booted == []
     assert code == headless.EXIT_TIMEOUT
+    detail = discord.failed[0][1]["detail"]
+    assert "order=TM0000" in detail
+    assert f"after {int(clock['t'])}s" in detail
     assert _pending(bot_dir)["pending_notify"] is False
     assert _pending(bot_dir)["session_key"] == SESSION
 

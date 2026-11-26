@@ -166,6 +166,24 @@ def test_sweep_without_a_lister_is_a_no_op_off_windows(tmp_path):
     assert list(tmp_path.glob("leftover_sweep.json")) == []
 
 
+def test_parse_cim_process_json_accepts_one_object_or_a_list():
+    from src.live.leftover_sweep import parse_cim_process_json
+
+    one = (
+        '{"ProcessId":7,"Name":"python.exe",'
+        '"CommandLine":"python.exe run_bot_cli.py deploy --symbol MXF00 --bot night2",'
+        '"CreationDate":"/Date(1700000000000)/"}'
+    )
+    parsed = parse_cim_process_json(one)
+    assert len(parsed) == 1
+    assert parsed[0].pid == 7 and parsed[0].image == "python.exe"
+    assert parsed[0].created_at == 1700000000.0
+    assert "deploy" in parsed[0].command_line
+    both = "[" + one + "," + one.replace('"ProcessId":7', '"ProcessId":8') + "]"
+    assert [proc.pid for proc in parse_cim_process_json(both)] == [7, 8]
+    assert parse_cim_process_json("  ") == []
+
+
 def test_leftover_sweep_source_has_no_stop_api():
     import src.live.leftover_sweep as mod
 
