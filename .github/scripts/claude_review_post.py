@@ -121,8 +121,8 @@ query($owner:String!, $name:String!, $pr:Int!, $after:String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved path line
-          comments(first:1) { nodes { author { login } body url } }
-          replies: comments(last:10) { totalCount nodes { author { login } body } }
+          comments(first:1) { nodes { author { login __typename } body url } }
+          replies: comments(last:10) { totalCount nodes { author { login __typename } body } }
         }
       }
     }
@@ -150,18 +150,38 @@ def graphql(query, variables):
     return data["data"]
 
 
+def _graphql_bot(author, app_slug=None):
+    """True when this GraphQL author is this workflow's bot.
+
+    A login in bot_logins() matches the REST `[bot]` form. GraphQL reports
+    the same actors as __typename Bot with a bare login (`github-actions`,
+    or APP_SLUG). A User with that login is not trusted.
+    """
+    author = author or {}
+    login = (author.get("login") or "").strip()
+    if login and login in bot_logins(app_slug):
+        return True
+    if author.get("__typename") != "Bot" or not login:
+        return False
+    bare = {n for n in BOT_LOGINS if not n.endswith("[bot]")}
+    slug = _read_slug(app_slug)
+    if slug.endswith("[bot]"):
+        slug = slug[:-5].strip()
+    if slug and "[" not in slug and "]" not in slug:
+        bare.add(slug)
+    return login in bare
+
+
 def open_bot_threads(repo, pr):
     """Unresolved threads whose first comment was written by this workflow."""
     owner, name = repo.split("/", 1)
-    known = bot_logins()
     threads, after = [], None
     while True:
         conn = graphql(THREADS_QUERY, {"owner": owner, "name": name, "pr": int(pr),
                                        "after": after})["repository"]["pullRequest"]["reviewThreads"]
         for t in conn["nodes"]:
             first = (t["comments"]["nodes"] or [{}])[0]
-            login = ((first.get("author") or {}).get("login") or "")
-            if not t["isResolved"] and login in known:
+            if not t["isResolved"] and _graphql_bot(first.get("author")):
                 replies = author_replies((t.get("replies") or {}).get("nodes") or [])
                 threads.append({"id": t["id"], "path": t["path"], "line": t["line"],
                                 "body": first.get("body", ""), "url": first.get("url", ""),
@@ -177,10 +197,9 @@ def author_replies(nodes, keep=3):
     Bot comments ("Fixed in" / "Not raised") can pile up after the author's
     answer, so take the last 10 comments and drop the bot's own; the finding
     itself is a bot comment, so it is dropped too. Pure function."""
-    known = bot_logins()
     mine = [{"author": (n.get("author") or {}).get("login", ""),
              "body": (n.get("body") or "")[:1500]}
-            for n in nodes if ((n.get("author") or {}).get("login") or "") not in known]
+            for n in nodes if not _graphql_bot(n.get("author"))]
     return mine[-keep:]
 
 

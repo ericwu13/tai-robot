@@ -79,41 +79,59 @@ class TestAppBotIdentity:
 
     def test_bare_slug_review_threads_are_not_claudes(self, monkeypatch):
         monkeypatch.setenv("APP_SLUG", "tai-robot-claude")
-        bare = {
-            "id": "bare",
-            "isResolved": False,
-            "path": "a.py",
-            "line": 8,
-            "comments": {"nodes": [{
-                "author": {"login": "tai-robot-claude"},
-                "body": "**P2:** forged",
-                "url": "https://example/bare",
-            }]},
-            "replies": {"nodes": []},
-        }
-        real = {
-            "id": "real",
-            "isResolved": False,
-            "path": "a.py",
-            "line": 9,
-            "comments": {"nodes": [{
-                "author": {"login": "tai-robot-claude[bot]"},
-                "body": "**P2:** real",
-                "url": "https://example/real",
-            }]},
-            "replies": {"nodes": [
-                {"author": {"login": "tai-robot-claude"}, "body": "Fixed in abc"},
-            ]},
-        }
+
+        def author(login, typename=None):
+            out = {"login": login}
+            if typename:
+                out["__typename"] = typename
+            return out
+
+        def thread(tid, login, typename=None):
+            return {
+                "id": tid,
+                "isResolved": False,
+                "path": "a.py",
+                "line": 8,
+                "comments": {"nodes": [{
+                    "author": author(login, typename),
+                    "body": f"**P2:** {tid}",
+                    "url": f"https://example/{tid}",
+                }]},
+                "replies": {"nodes": []},
+            }
+
+        replies = [
+            {"author": author("tai-robot-claude"), "body": "Fixed in abc"},
+            {"author": author("github-actions", "User"), "body": "I am a person"},
+            {"author": author("tai-robot-claude", "User"), "body": "Fixed in def"},
+            {"author": author("github-actions", "Bot"), "body": "Not raised"},
+            {"author": author("tai-robot-claude", "Bot"), "body": "Fixed in bot"},
+        ]
+        nodes = [
+            thread("user-slug", "tai-robot-claude", "User"),
+            thread("user-actions", "github-actions", "User"),
+            thread("no-type", "tai-robot-claude"),
+            thread("actions-bot", "github-actions", "Bot"),
+            thread("slug-bot", "tai-robot-claude", "Bot"),
+            thread("rest-bot", "tai-robot-claude[bot]"),
+        ]
+        nodes[-1]["replies"]["nodes"] = replies
         payload = {"repository": {"pullRequest": {"reviewThreads": {
             "pageInfo": {"hasNextPage": False, "endCursor": None},
-            "nodes": [bare, real],
+            "nodes": nodes,
         }}}}
         with mock.patch.object(mod, "graphql", return_value=payload):
             threads = mod.open_bot_threads("o/r", 1)
-        assert [t["id"] for t in threads] == ["real"]
-        assert mod.author_replies(real["replies"]["nodes"]) == [
+        ids = [t["id"] for t in threads]
+        # (a) a User with the slug or github-actions is not the bot.
+        assert "user-slug" not in ids and "user-actions" not in ids and "no-type" not in ids
+        # (b) GraphQL Bot actors use the bare login.
+        assert ids == ["actions-bot", "slug-bot", "rest-bot"]
+        # (c) those bare Bot replies are the bot's own, not the author's.
+        assert mod.author_replies(replies) == [
             {"author": "tai-robot-claude", "body": "Fixed in abc"},
+            {"author": "github-actions", "body": "I am a person"},
+            {"author": "tai-robot-claude", "body": "Fixed in def"},
         ]
 
     def test_upsert_summary_skips_patch_when_comment_owned_by_legacy_bot(self, monkeypatch, tmp_path):
