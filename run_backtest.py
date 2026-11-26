@@ -10034,7 +10034,8 @@ class BacktestApp:
         # Route Discord and LiveRunner logging into the app's _log()
         attach_app_log_handlers()
 
-        # Initialize Discord notifications
+        # Initialize Discord notifications. A pre-boot alert may already
+        # have installed the worker; replacing it would leak that client.
         global _discord
         from src.live.discord_notify import DiscordNotifier
         bot_token = self._settings.get("discord_bot_token", "")
@@ -10045,11 +10046,22 @@ class BacktestApp:
             "discord_daily_report_channel_id", "")
         regime_channel_id = self._settings.get(
             "discord_regime_channel_id", "")
-        _discord = DiscordNotifier(bot_token, channel_id,
-                                   bot_name=bot_name, symbol=symbol,
-                                   evolution_channel_id=evolution_channel_id,
-                                   daily_report_channel_id=daily_report_channel_id,
-                                   regime_channel_id=regime_channel_id)
+        if isinstance(_discord, DiscordNotifier):
+            _discord._bot_name = bot_name
+            _discord._symbol = symbol
+            _discord._evolution_channel_id = (
+                evolution_channel_id.strip() if evolution_channel_id else "")
+            _discord._daily_report_channel_id = (
+                daily_report_channel_id.strip() if daily_report_channel_id else "")
+            _discord._regime_channel_id = (
+                regime_channel_id.strip() if regime_channel_id else "")
+        else:
+            _discord = DiscordNotifier(
+                bot_token, channel_id,
+                bot_name=bot_name, symbol=symbol,
+                evolution_channel_id=evolution_channel_id,
+                daily_report_channel_id=daily_report_channel_id,
+                regime_channel_id=regime_channel_id)
         _deploy_mode_zh = {"paper": "模擬", "semi_auto": "半自動",
                            "auto": "全自動"}.get(trading_mode, trading_mode)
         if _discord.enabled:

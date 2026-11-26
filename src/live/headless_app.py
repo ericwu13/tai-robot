@@ -690,7 +690,17 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     if not token or not channel:
         return None
     from src.live.discord_notify import DiscordNotifier
-    return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
+    # One notifier for this process. A second call (still-waiting, then
+    # the give-up) must flush the same worker, and deploy keeps it.
+    notifier = DiscordNotifier(
+        token, channel, bot_name=bot, symbol=symbol,
+        evolution_channel_id=str(cfg.get("discord_evolution_channel_id") or ""),
+        daily_report_channel_id=str(
+            cfg.get("discord_daily_report_channel_id") or ""),
+        regime_channel_id=str(cfg.get("discord_regime_channel_id") or ""),
+    )
+    rb._discord = notifier
+    return notifier
 
 
 # ce93800a flushed 5s after spawn. The child is already in wait_for_old_pid.

@@ -1429,14 +1429,15 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     finished = time.monotonic()
     assert code != EXIT_OK
     assert sent and sent[-1][0] <= finished
-    assert "Still waiting" in sent[0][1]
-    assert "82" in sent[0][1]
-    assert "old process still alive" in sent[-1][1]
+    texts = [text for _ts, text in sent]
+    assert any("Still waiting" in text and "82" in text for text in texts)
+    assert any("old process still alive" in text for text in texts)
     assert _pending(bot_dir)["pending_notify"] is False
     assert "discord flush True" in capsys.readouterr().out
     from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
-    # Still-waiting is queued and not flushed. The give-up flush
-    # waits that send out too.
+    # Still-waiting is queued on the one pre-boot notifier and is not
+    # flushed on its own. The give-up flush is that same notifier, so
+    # it waits for the still-waiting send as well.
     assert timeouts == [FLUSH_EXIT_TIMEOUT_S]
 
     sent.clear()
@@ -1507,6 +1508,57 @@ def test_flush_waits_for_a_priority_send_and_times_out_when_it_blocks():
     started = time.monotonic()
     assert stuck.flush(timeout_s=0.15) is False
     assert time.monotonic() - started < 1.0
+
+
+def test_pre_boot_still_waiting_and_give_up_share_one_notifier(monkeypatch):
+    """The give-up flush must wait for the still-waiting send.
+
+    Two DiscordNotifier instances race: flush on the second does not
+    see the message queued on the first.
+    """
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+
+    made = []
+    sent = []
+    flushed = []
+    real_init = DiscordNotifier.__init__
+    real_flush = DiscordNotifier.flush
+
+    def _init(self, *args, **kwargs):
+        made.append(self)
+        real_init(self, *args, **kwargs)
+
+    def _deliver(self, content, target):
+        sent.append(self)
+        return True
+
+    def _flush(self, timeout_s=5.0):
+        flushed.append(self)
+        return real_flush(self, timeout_s)
+
+    monkeypatch.setattr(DiscordNotifier, "__init__", _init)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _deliver)
+    monkeypatch.setattr(DiscordNotifier, "flush", _flush)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", lambda: {
+        "discord_bot_token": "t",
+        "discord_channel_id": "1",
+        "discord_evolution_channel_id": "2",
+        "discord_daily_report_channel_id": "3",
+        "discord_regime_channel_id": "4",
+    })
+    ha._emit_restart_still_waiting(
+        9, 60.0, bot="night1", symbol="TMF00", order_symbol="TM0000")
+    ha._emit_restart_failed(
+        "old process still alive", detail="pid 9", bot="night1", symbol="TMF00")
+    assert len(made) == 1
+    assert sent and all(item is made[0] for item in sent)
+    assert flushed == [made[0]]
+    assert rb._discord is made[0]
+    assert made[0]._evolution_channel_id == "2"
+    assert made[0]._daily_report_channel_id == "3"
+    assert made[0]._regime_channel_id == "4"
 
 
 def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path):
