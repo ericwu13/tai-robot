@@ -130,7 +130,8 @@ from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
-    open_interest_query_rejected,
+    OI_QUERY_MIN_INTERVAL_S, open_interest_query_rejected,
+    sleep_open_interest_interval, wait_open_interest_spacing,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.broker_port import DEFAULT_BROKER_MODE, require_inprocess
@@ -9844,12 +9845,31 @@ class BacktestApp:
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
+                # Capital wants >= 5s between GetOpenInterestGW calls. The
+                # OnComplete reconcile in this process often lands well
+                # inside that gap. Only this pre-deploy call waits; rights,
+                # mode-request, and the account poll are not spaced here.
+                wait_open_interest_spacing()
                 # New generation. clear_positions() must not be what drops
                 # the previous answer; only this query can complete it.
                 self._account_monitor.begin_oi_query()
                 code = _broker.get_open_interest(
                     user_id, self._futures_account, 1)
                 _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — retry once after "
+                        f"{OI_QUERY_MIN_INTERVAL_S:.0f}s"
+                    )
+                    sleep_open_interest_interval()
+                    self._account_monitor.begin_oi_query()
+                    code = _broker.get_open_interest(
+                        user_id, self._futures_account, 1)
+                    _log(
+                        "部署前持倉查詢 Pre-deploy GetOpenInterestGW retry: "
+                        f"code={code}"
+                    )
                 if open_interest_query_rejected(code):
                     self._predeploy_oi_failed = True
                     self._predeploy_oi_unknown_reason = (

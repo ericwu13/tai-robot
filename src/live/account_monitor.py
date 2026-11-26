@@ -58,6 +58,56 @@ def open_interest_query_rejected(code) -> bool:
         return True
 
 
+# Capital requires at least this long between GetOpenInterestGW calls.
+# GetFutureRights is a separate documented row and is not on this clock.
+OI_QUERY_MIN_INTERVAL_S = 5.0
+
+# Process-wide. Every GetOpenInterestGW this process makes stamps it,
+# including reconcile, pre-deploy, fill-poll, mode-request, and the
+# account poll (they all go through ComBrokerPort.get_open_interest).
+_last_oi_query_mono: float | None = None
+
+
+def _oi_monotonic() -> float:
+    return time.monotonic()
+
+
+def _oi_sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def reset_open_interest_query_clock() -> None:
+    """Drop the stamp. Tests only; production never starts from a fake clock."""
+    global _last_oi_query_mono
+    _last_oi_query_mono = None
+
+
+def note_open_interest_query() -> None:
+    """Stamp one GetOpenInterestGW this process is about to make."""
+    global _last_oi_query_mono
+    _last_oi_query_mono = float(_oi_monotonic())
+
+
+def wait_open_interest_spacing() -> float:
+    """Sleep the remainder of the 5s gap. ``0`` when no stamp or the gap elapsed.
+
+    Does not stamp. The call that follows stamps itself.
+    """
+    last = _last_oi_query_mono
+    if last is None:
+        return 0.0
+    delay = OI_QUERY_MIN_INTERVAL_S - (float(_oi_monotonic()) - float(last))
+    if delay <= 0.0:
+        return 0.0
+    _oi_sleep(delay)
+    return delay
+
+
+def sleep_open_interest_interval() -> None:
+    """One full 5s gap. Used for the single pre-deploy retry, not a remainder."""
+    _oi_sleep(OI_QUERY_MIN_INTERVAL_S)
+
+
 def parse_open_interest(bstr: str) -> dict | None:
     """Parse OnOpenInterest callback data into a dict.
 

@@ -735,6 +735,40 @@ def _flush_discord(discord) -> None:
     _log_discord_flush(discord, timeout_s)
 
 
+def _emit_restart_still_waiting(old_pid: int, waited_s: float, *,
+                                bot: str = "", symbol: str = "") -> None:
+    """Priority "still waiting" alert. Does not clear ``pending_notify``.
+
+    Distinct from ``_emit_restart_failed`` so operators can tell a live
+    wait from a give-up. Flushed with the same helper as the failure alert.
+    """
+    try:
+        rb._log(
+            f"[HEADLESS] pid-wait still waiting old={old_pid} "
+            f"after {int(waited_s)}s symbol={symbol}"
+        )
+    except Exception:
+        pass
+    discord = _resolve_discord(bot=bot, symbol=symbol)
+    if discord is None or not getattr(discord, "enabled", False):
+        return
+    try:
+        method = getattr(discord, "degraded_restart_still_waiting", None)
+        if callable(method):
+            method(old_pid=int(old_pid), waited_s=float(waited_s), bot=bot)
+        else:
+            discord.notify(
+                f"仍在等待舊行程 Still waiting for old process "
+                f"pid {old_pid} after {int(waited_s)}s",
+                priority=True,
+            )
+        from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+        _log_discord_flush(discord, FLUSH_EXIT_TIMEOUT_S)
+    except Exception as exc:
+        rb._log(f"[HEADLESS] still-waiting alert failed: "
+                f"[{type(exc).__name__}] {exc}")
+
+
 def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
                          symbol: str = "") -> None:
     rb._log("[HEADLESS] degraded auto-restart failed: "
@@ -810,7 +844,8 @@ def _spawn_pending_restart(driver, code: int) -> int:
 def run_deploy(args) -> int:
     from src.live.degraded_restart import (
         DEFAULT_RELOGIN_WAIT_S, PID_WAIT_S, acquire_relogin_slot,
-        clear_pending_notify, release_relogin_slot, wait_for_old_pid,
+        clear_pending_notify, poll_old_pid_until_exit_or_budget,
+        release_relogin_slot, wait_for_old_pid,
     )
 
     bot_dir = _deploy_bot_dir(args)
@@ -828,15 +863,37 @@ def run_deploy(args) -> int:
             rb._log(f"[HEADLESS] pid-wait start old={old_pid}")
         except Exception:
             pass
+        # The 60s primitive stays. A miss does not give up and does not
+        # clear pending_notify: the recovery line still has to fire if
+        # this process later reaches tick subscription.
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
-            _emit_restart_failed(
-                "old process still alive",
-                detail=f"pid {old_pid} still alive after {int(PID_WAIT_S)}s",
-                bot=bot_name,
-                symbol=symbol,
-            )
-            clear_pending_notify(bot_dir)
-            return EXIT_TIMEOUT
+            _emit_restart_still_waiting(
+                old_pid, PID_WAIT_S, bot=bot_name, symbol=symbol)
+            outcome, mins_left = poll_old_pid_until_exit_or_budget(
+                old_pid, symbol)
+            if outcome == "budget":
+                try:
+                    rb._log(
+                        f"[HEADLESS] pid-wait budget gone old={old_pid} "
+                        f"symbol={symbol} mins_left={mins_left}"
+                    )
+                except Exception:
+                    pass
+                _emit_restart_failed(
+                    "old process still alive",
+                    detail=(f"pid {old_pid} still alive after "
+                            f"{int(PID_WAIT_S)}s"),
+                    bot=bot_name,
+                    symbol=symbol,
+                )
+                clear_pending_notify(bot_dir)
+                return EXIT_TIMEOUT
+            try:
+                exited = rb._taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+                rb._log(
+                    f"[HEADLESS] old pid {old_pid} exited at {exited} TPE")
+            except Exception:
+                pass
     stagger = bool(getattr(args, "relogin_stagger", False))
     held_slot = False
     if stagger:
