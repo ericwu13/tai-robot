@@ -1707,7 +1707,7 @@ class BacktestApp:
         self.root = root
         # Last bot this process deployed. _stop_live does not clear it:
         # _shutdown_link writes .exiting here after the runner is gone.
-        self._exit_marker_bot_dir = None
+        self._exit_marker_dir = None
         # HeadlessBotApp sets ``policy`` before delegating here. Headless
         # bots get no theme at all: widget construction stays identical to
         # the unthemed app and the live path does zero extra work.
@@ -3057,14 +3057,12 @@ class BacktestApp:
 
         Then arm the exit dump and release COM. ``_stop_live`` does not
         call this: a GUI Stop Bot keeps the process and its COM alive.
-        The exit marker names ``_exit_marker_bot_dir`` (the last deploy).
+        The exit marker names ``_exit_marker_dir`` (the last deploy).
         Unset means this process never deployed, so nothing is written.
         """
         try:
-            bot_dir = getattr(self, "_exit_marker_bot_dir", None)
-            if bot_dir:
-                from src.live.leftover_sweep import write_exiting_marker
-                write_exiting_marker(bot_dir)
+            from src.live.leftover_sweep import write_exiting_marker
+            write_exiting_marker(getattr(self, "_exit_marker_dir", None))
         except Exception:
             pass
         self._cancel_reply_poll()
@@ -9962,6 +9960,8 @@ class BacktestApp:
             )
             self._regime_manager = None
         self._live_runner.acquire_lock()
+        # Last bot this process deployed. _stop_live does not clear it.
+        self._exit_marker_dir = self._live_runner.bot_dir
         self._position_ledger = PositionLedger(
             self._live_runner.bot_dir,
             bot_id=os.path.basename(os.path.normpath(self._live_runner.bot_dir)),
@@ -10014,10 +10014,7 @@ class BacktestApp:
         )
 
         # Open debug log, then arm the native dump. A faulthandler open
-        # failure must not abort the deploy. The marker dir is the last
-        # bot this process deployed, recorded even if the arm fails, and
-        # left in place by _stop_live.
-        self._exit_marker_bot_dir = self._live_runner.bot_dir
+        # failure must not abort the deploy.
         _open_debug_log(self._live_runner.bot_dir)
         try:
             enable_reconnect_faulthandler(self._live_runner.bot_dir)

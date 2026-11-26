@@ -154,7 +154,7 @@ def _quiet_shutdown(monkeypatch):
 def _shutdown_app():
     import run_backtest as rb
     app = rb.BacktestApp.__new__(rb.BacktestApp)
-    app._exit_marker_bot_dir = None
+    app._exit_marker_dir = None
     app._link_host = None
     return app
 
@@ -166,7 +166,7 @@ def test_gui_stop_does_not_alert_while_the_process_stays_up(tmp_path, monkeypatc
     runner = _runner(tmp_path, "paper")
     runner.acquire_lock()
     app, _discord = _app(monkeypatch, runner, "paper", confirmed=False)
-    app._exit_marker_bot_dir = runner.bot_dir
+    app._exit_marker_dir = runner.bot_dir
     app._stop_live()
     assert app._live_runner is None
     alerts = []
@@ -189,16 +189,21 @@ def test_redeploy_marks_the_second_bot_on_exit(tmp_path, monkeypatch):
         NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="Second")
     app = _shutdown_app()
     deploy = inspect.getsource(rb.BacktestApp._deploy_live_continue)
-    arm = deploy.index("enable_reconnect_faulthandler")
-    assert "_exit_marker_bot_dir = self._live_runner.bot_dir" in deploy[arm - 500:arm]
+    lock = deploy.index("self._live_runner.acquire_lock()")
+    assert ("self._exit_marker_dir = self._live_runner.bot_dir"
+            in deploy[lock:lock + 200])
+    shutdown = inspect.getsource(rb.BacktestApp._shutdown_link)
+    assert ('write_exiting_marker(getattr(self, "_exit_marker_dir", None))'
+            in shutdown)
+    assert shutdown.index("write_exiting_marker") < shutdown.index("host.shutdown")
     init = inspect.getsource(rb.BacktestApp.__init__)
-    assert "_exit_marker_bot_dir = None" in init
-    assert "_exit_marker_bot_dir" not in inspect.getsource(rb.BacktestApp._stop_live)
+    assert "_exit_marker_dir = None" in init
+    assert "_exit_marker_dir" not in inspect.getsource(rb.BacktestApp._stop_live)
     first.acquire_lock()
-    app._exit_marker_bot_dir = first.bot_dir
+    app._exit_marker_dir = first.bot_dir
     first.release_lock()
     second.acquire_lock()
-    app._exit_marker_bot_dir = second.bot_dir
+    app._exit_marker_dir = second.bot_dir
     alerts = []
     check_exiting_markers(
         first.bot_dir, alert_fn=alerts.append,
@@ -221,7 +226,7 @@ def test_headless_stop_writes_the_marker_after_the_runner_is_gone(
     runner = _runner(tmp_path, "paper")
     runner.acquire_lock()
     app, _discord = _app(monkeypatch, runner, "paper", confirmed=False)
-    app._exit_marker_bot_dir = runner.bot_dir
+    app._exit_marker_dir = runner.bot_dir
     app._link_host = None
     app._stop_live()
     marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
