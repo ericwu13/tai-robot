@@ -1141,6 +1141,52 @@ def test_old_pid_wait_gives_up_when_the_session_budget_is_gone(
     assert "exited at" not in out
 
 
+def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
+        tmp_path, monkeypatch):
+    """Quote symbol still has budget; the front-month order symbol does not.
+
+    2026-11-18 13:16 TPE is that month's settlement morning. ``TMF00``
+    closes at 13:45 (29 min left). ``TM0000`` closes at 13:30 (14 min),
+    which is inside ``MIN_MINUTES_LEFT_FOR_RESTART``. The parent gate
+    uses the order symbol, so the child must not boot.
+    """
+    import src.live.headless_app as ha
+    import src.live.live_runner as live_runner
+    from src.market_data.kline_config import resolve_order_symbol
+
+    fixed = datetime(2026, 11, 18, 13, 16, tzinfo=TPE)
+    monkeypatch.setattr(live_runner, "_taipei_now", lambda: fixed)
+    assert resolve_order_symbol("TMF00") == "TM0000"
+    quote_left = live_runner.minutes_until_session_close("TMF00")
+    order_left = live_runner.minutes_until_session_close("TM0000")
+    assert quote_left > dr.MIN_MINUTES_LEFT_FOR_RESTART
+    assert order_left <= dr.MIN_MINUTES_LEFT_FOR_RESTART
+
+    _patch_project(monkeypatch, tmp_path)
+    clock = {"t": 0.0}
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] > 180:
+            raise RuntimeError("pid wait did not stop")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(
+        LiveRunner, "_pid_alive",
+        staticmethod(lambda _pid: clock["t"] <= dr.PID_WAIT_S))
+    booted = []
+    monkeypatch.setattr(
+        ha, "_boot", lambda *_a, **_k: booted.append("boot") or (None, EXIT_LOGIN))
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=91)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    assert booted == []
+    assert code == headless.EXIT_TIMEOUT
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
+
+
 def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch, capsys):
     import src.live.headless_app as ha
 

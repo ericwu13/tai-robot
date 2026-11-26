@@ -218,10 +218,10 @@ def poll_old_pid_until_exit_or_budget(
     Same ``poll_s`` default as :func:`wait_for_old_pid`. Give up when
     ``minutes_until_session_close`` is ``None`` or at or under
     ``MIN_MINUTES_LEFT_FOR_RESTART`` — the gate ``observe_app`` already
-    uses, not a new timeout. ``symbol`` is the deploy arg; it may not be
-    the front-month order symbol, so a settlement close can be 15 minutes
-    off. This does not call ``save_auto_restart`` and does not touch
-    ``session_key`` or ``pending_notify``.
+    uses, not a new timeout. ``symbol`` is that gate's order symbol
+    (``resolve_order_symbol`` of the deploy arg). This does not call
+    ``save_auto_restart`` and does not touch ``session_key`` or
+    ``pending_notify``.
 
     Budget is checked before liveness. A closed or near-close session
     does not fall through to login even if the pid died on the same poll.

@@ -842,12 +842,17 @@ def run_deploy(args) -> int:
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
             _emit_restart_still_waiting(
                 old_pid, PID_WAIT_S, bot=bot_name, symbol=symbol)
+            # Same symbol observe_app uses (watchdog.order_symbol).
+            # TMF00 keeps a 13:45 close; its order symbol TM0000
+            # settles at 13:30.
+            from src.market_data.kline_config import resolve_order_symbol
+            order_symbol = resolve_order_symbol(symbol) if symbol else symbol
             outcome, mins_left = poll_old_pid_until_exit_or_budget(
-                old_pid, symbol)
+                old_pid, order_symbol)
             if outcome == "budget":
                 rb._safe_log(
                     f"[HEADLESS] pid-wait budget gone old={old_pid} "
-                    f"symbol={symbol} mins_left={mins_left}"
+                    f"symbol={symbol} order={order_symbol} mins_left={mins_left}"
                 )
                 _emit_restart_failed(
                     "old process still alive",
