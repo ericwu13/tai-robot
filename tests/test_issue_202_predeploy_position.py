@@ -187,7 +187,8 @@ class _Gate:
 def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
               answer_snapshot=False, bare_hash=False, use_driver=True,
               gui_answer=None, resume_session=None, codes=None,
-              keep_oi_clock=False, preserve_oi_sleep=False):
+              keep_oi_clock=False, preserve_oi_sleep=False,
+              reply_after_s=None):
     """Drive ``_deploy_live_from`` up to the position gate.
 
     ``gui_answer`` uses the real GUI ``_confirm`` (messagebox is patched
@@ -218,7 +219,9 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
             "auto": "全自動 Auto",
         },
         _settings={},
-        _trading_guard=SimpleNamespace(daily_loss_limit=0, reset=lambda: None),
+        _trading_guard=SimpleNamespace(
+            daily_loss_limit=0, reset=lambda: None, fill_pending=False),
+        real_pos_var=_Var(""),
         _fill_poller=SimpleNamespace(reset=lambda: None),
         _session_end_exit_pending=False,
         _futures_account="F0123456",
@@ -247,11 +250,48 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
     app._oi_wait_must_block = lambda: rb.BacktestApp._oi_wait_must_block(app)
     app._process_ui_queue = lambda: rb.BacktestApp._process_ui_queue(app)
 
+    # Fake wall clock for the blocking pre-deploy wait. ``time.sleep(0.1)``
+    # advances it; nothing else in this harness sleeps on ``time.sleep``.
+    clock = {"ms": 0}
+    accepted = {"ms": None}
+    delivered = {"done": False}
+    delay_ms = (None if reply_after_s is None
+                else int(round(float(reply_after_s) * 1000)))
+
+    def _emit_open_interest():
+        if delivered["done"]:
+            return
+        delivered["done"] = True
+        previous = rb._app
+        rb._app = app
+        try:
+            rb.SKOrderLibEvents().OnOpenInterest("001,查無資料")
+            rb.SKOrderLibEvents().OnOpenInterest("##")
+        finally:
+            rb._app = previous
+
     def _wait():
         gate.waits.append(1)
-        return rb.BacktestApp._wait_oi_snapshot_blocking(app)
+        rb.BacktestApp._wait_oi_snapshot_blocking(app)
+        base = 0 if accepted["ms"] is None else accepted["ms"]
+        gate.slept_s = (clock["ms"] - base) / 1000.0
+        # The wait has returned. A reply scheduled past its deadline is
+        # queued now and is not drained, so the UNKNOWN check misses it.
+        if (delay_ms is not None
+                and not app._account_monitor.oi_snapshot_received):
+            clock["ms"] = base + delay_ms
+            _emit_open_interest()
 
     app._wait_oi_snapshot_blocking = _wait
+
+    def _fake_time():
+        return clock["ms"] / 1000.0
+
+    def _fake_sleep(seconds):
+        clock["ms"] += int(round(float(seconds) * 1000))
+        if (delay_ms is not None and accepted["ms"] is not None
+                and clock["ms"] - accepted["ms"] >= delay_ms):
+            _emit_open_interest()
 
     def _continue(*args, **kwargs):
         gate.continued.append(args)
@@ -267,6 +307,10 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
         this_code = code
         if code_seq:
             this_code = code_seq.pop(0)
+        if (name == "GetOpenInterestGW"
+                and not open_interest_query_rejected(this_code)
+                and accepted["ms"] is None):
+            accepted["ms"] = clock["ms"]
         if (answer_snapshot and name == "GetOpenInterestGW"
                 and not open_interest_query_rejected(this_code)):
             gen = app._account_monitor.oi_query_generation
@@ -291,20 +335,34 @@ def _run_gate(monkeypatch, *, mode, policy, code=0, raises=False,
     app._deploy_live_from = lambda request: rb.BacktestApp._deploy_live_from(app, request)
     gate.app = app
 
-    if not use_driver:
-        gate.returned = app._deploy_live_from(req)
-        return gate
+    def _drive():
+        if not use_driver:
+            gate.returned = app._deploy_live_from(req)
+            return
+        driver = DeployDriver.__new__(DeployDriver)
+        driver.app = app
+        # A successful headless deploy writes headless.json here. Keep it
+        # out of the repo (and out of data/).
+        driver.bot_dir = os.path.join(
+            tempfile.gettempdir(), "issue202-not-a-live-tree")
+        driver.req = req
+        driver.exit_code = None
+        driver.root = app.root
+        driver._deploy()
+        gate.exit_code = driver.exit_code
 
-    driver = DeployDriver.__new__(DeployDriver)
-    driver.app = app
-    # A successful headless deploy writes headless.json here. Keep it out of
-    # the repo (and out of data/).
-    driver.bot_dir = os.path.join(tempfile.gettempdir(), "issue202-not-a-live-tree")
-    driver.req = req
-    driver.exit_code = None
-    driver.root = app.root
-    driver._deploy()
-    gate.exit_code = driver.exit_code
+    if reply_after_s is None:
+        _drive()
+    else:
+        real_time = rb.time.time
+        real_sleep = rb.time.sleep
+        rb.time.time = _fake_time
+        rb.time.sleep = _fake_sleep
+        try:
+            _drive()
+        finally:
+            rb.time.time = real_time
+            rb.time.sleep = real_sleep
     return gate
 
 
@@ -322,6 +380,48 @@ def test_headless_unknown_timeout_exits_deploy_refused(monkeypatch, mode):
     assert gate.confirms and gate.confirms[0][0] == hl.TITLE_UNKNOWN_POSITION
     assert gate.confirms[0][1] is True  # GUI default No is requested
     assert gate.exit_code == hl.EXIT_DEPLOY_REFUSED
+
+
+def test_predeploy_wait_accepts_reply_at_10s_and_not_after_15s(monkeypatch):
+    """A fake clock delivers OnOpenInterest through the blocking wait.
+
+    10s after the accepted GetOpenInterestGW is inside the 15s deadline,
+    so the book is a snapshot and deploy continues. A reply after 15s is
+    queued only once that wait has returned, and the book stays UNKNOWN.
+    """
+    try:
+        early = _run_gate(
+            monkeypatch, mode="auto",
+            policy=hl.HeadlessPolicy(),
+            code=0,
+            reply_after_s=10.0,
+        )
+        assert early.app._account_monitor.oi_snapshot_received, (
+            "OnOpenInterest 10s after the accepted query was UNKNOWN "
+            f"(waited {early.slept_s}s, "
+            f"OI_SNAPSHOT_TIMEOUT_S={rb.OI_SNAPSHOT_TIMEOUT_S})"
+        )
+        assert early.slept_s == pytest.approx(10.0)
+        assert early.continued
+        assert early.confirms == []
+        assert early.exit_code is None
+        assert early.com_calls == ["GetOpenInterestGW"]
+
+        late = _run_gate(
+            monkeypatch, mode="auto",
+            policy=hl.HeadlessPolicy(),
+            code=0,
+            reply_after_s=15.1,
+        )
+        assert late.slept_s == pytest.approx(15.0)
+        assert rb._ui_queue.qsize() == 2  # 001 and ## arrived after the wait
+        assert late.app._account_monitor.oi_snapshot_received is False
+        assert late.continued == []
+        assert late.exit_code == hl.EXIT_DEPLOY_REFUSED
+        assert late.confirms and late.confirms[0][0] == hl.TITLE_UNKNOWN_POSITION
+        assert late.com_calls == ["GetOpenInterestGW"]
+    finally:
+        _drain_ui_queue()
 
 
 @pytest.mark.parametrize("mode", ["auto", "semi_auto"])
