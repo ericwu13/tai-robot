@@ -209,7 +209,7 @@ class TestWorkflowSecurityInvariants:
         assert apply_job["permissions"] == {"contents": "read", "issues": "write"}
 
         gate_step = next(s for s in triage_job["steps"] if s.get("id") == "gate")
-        assert "gemini-4-neon" in gate_step["run"]
+        assert "gemini-4-hydrogen" in gate_step["run"]
         assert "gemini-2.5-pro" not in gate_step["run"]
 
         gemini_steps = [
@@ -258,6 +258,6 @@ class TestWorkflowSecurityInvariants:
         body = mod.format_triage_comment(
             {"summary_markdown": "## Gemini triage\nLooks like a P2."},
             added_labels=["bug", "P2"],
-            model_name="gemini-4-neon",
+            model_name="gemini-4-hydrogen",
         )
-        assert "model `gemini-4-neon`" in body
+        assert "model `gemini-4-hydrogen`" in body

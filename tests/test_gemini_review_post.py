@@ -279,7 +279,7 @@ class TestThreadIsolationAndApply:
              mock.patch.object(mod, "gh_api", side_effect=fake_api):
             out = mod.apply_review(
                 "o/r", 50, "abc1234deadbeef", res_file, ctx_file,
-                diff_h="11223344", model_name="gemini-4-neon", app_slug="tai-robot-gemini",
+                diff_h="11223344", model_name="gemini-4-hydrogen", app_slug="tai-robot-gemini",
             )
 
         assert out["verdict"] == "PASS" and out["action"] == "created" and out["failed_inline"] == 0
@@ -290,7 +290,7 @@ class TestThreadIsolationAndApply:
         assert len(reviews) == 1 and reviews[0]["event"] == "APPROVE"
         comments = [p for m, u, p in rest_calls if m == "POST" and u == "repos/o/r/issues/50/comments"]
         assert len(comments) == 1 and "<!-- gemini-review-state:" in comments[0]["body"]
-        assert "gemini-4-neon" in comments[0]["body"]
+        assert "gemini-4-hydrogen" in comments[0]["body"]
 
     def test_resolve_failure_exits_nonzero_and_does_not_approve(self, capsys, monkeypatch):
         monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
@@ -332,7 +332,7 @@ class TestWorkflowSecurityInvariants:
         }
 
         gate_step = next(s for s in review_job["steps"] if s.get("id") == "gate")
-        assert "gemini-4-neon" in gate_step["run"]
+        assert "gemini-4-hydrogen" in gate_step["run"]
         assert "gemini-2.5-pro" not in gate_step["run"]
 
         gemini_steps = [

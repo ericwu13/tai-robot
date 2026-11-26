@@ -61,9 +61,10 @@ jobs:
           set -euo pipefail
           eligible=false
           issue_num="${ISSUE_EVENT_NUM:-$ISSUE_INPUT_NUM}"
-          # Default to Gemini 4 Neon (GA coding/debugging model, 1M context, default high thinking).
-          # Override with repo variable GEMINI_TRIAGE_MODEL (e.g. gemini-4-carbon or gemini-4-hydrogen).
-          model="${MODEL_VAR:-gemini-4-neon}"
+          # Default to Gemini 4 Hydrogen (Gemini 4 coding model available on the $0 Free API tier,
+          # 1M context, default high thinking). Override with repo variable GEMINI_TRIAGE_MODEL
+          # (e.g. gemini-4-neon or gemini-4-carbon on a paid key).
+          model="${MODEL_VAR:-gemini-4-hydrogen}"
 
           if [ "$HAS_GEMINI_KEY" != "true" ]; then
             echo "GEMINI_API_KEY secret is not configured — skipping Gemini triage."
