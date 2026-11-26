@@ -433,6 +433,18 @@ class DeployDriver(_Driver):
             self._restart_policy = policy
         return policy
 
+    def _log_restart_outcome(self, outcome) -> None:
+        """One line per outcome change. A steady not-degraded poll is silent."""
+        key = (type(outcome).__name__, str(getattr(outcome, "reason", "")))
+        if key == ("Noop", "not_degraded"):
+            self._restart_logged = None
+            return
+        if key == getattr(self, "_restart_logged", None):
+            return
+        self._restart_logged = key
+        rb._log(f"[HEADLESS] degraded-restart policy: {key[0]}/{key[1]} "
+                f"mode={getattr(self.app, '_trading_mode', '')}")
+
     def _maybe_degraded_restart(self) -> None:
         """One keep-position restart per open session, or one alert."""
         if self.exit_code is not None:
@@ -446,6 +458,8 @@ class DeployDriver(_Driver):
             self._begin_degraded_restart(outcome)
         elif isinstance(outcome, AlertOnly):
             self._alert_restart_skipped(outcome)
+        else:
+            self._log_restart_outcome(outcome)
 
     def _begin_degraded_restart(self, decision: RestartDecision) -> None:
         app = self.app
@@ -648,6 +662,7 @@ class BacktestDriver(_Driver):
 # ── entry points used by run_bot_cli.py ──
 
 def _boot(policy: HeadlessPolicy, need_com: bool) -> tuple[HeadlessBotApp | None, int]:
+    rb._mark_process_booted()
     rb._init_com()
     if need_com and not rb._com_available:
         print("Capital API COM not available (SDK libs missing or not registered)",
@@ -876,7 +891,7 @@ def run_deploy(args) -> int:
                     symbol=symbol,
                 )
                 clear_pending_notify(bot_dir)
-                return _deploy_exit(EXIT_TIMEOUT)
+                return EXIT_TIMEOUT
             exited = rb._taipei_now().strftime("%Y-%m-%d %H:%M:%S")
             rb._safe_log(
                 f"[HEADLESS] old pid {old_pid} exited at {exited} TPE")
@@ -892,7 +907,7 @@ def run_deploy(args) -> int:
                 symbol=symbol,
             )
             clear_pending_notify(bot_dir)
-            return _deploy_exit(EXIT_TIMEOUT)
+            return EXIT_TIMEOUT
         held_slot = True
     app = None
     driver = None
@@ -909,7 +924,6 @@ def run_deploy(args) -> int:
             _fail_pending_replacement(
                 bot_dir, bot_name, "replacement deploy failed",
                 f"{type(exc).__name__}: {exc}", symbol)
-        rb.note_return_from_main()
         raise
     finally:
         # LeaveMonitor and root.destroy finish here, before any spawn.
@@ -921,13 +935,7 @@ def run_deploy(args) -> int:
         _fail_pending_replacement(
             bot_dir, bot_name, "replacement deploy failed", f"exit {code}",
             symbol)
-    return _deploy_exit(_spawn_pending_restart(driver, code))
-
-
-def _deploy_exit(code: int) -> int:
-    """Log process exit for a deploy that imported the bot. Not for list/status."""
-    rb.note_return_from_main()
-    return code
+    return _spawn_pending_restart(driver, code)
 
 
 def _drive_until_exit(driver, app) -> int:
@@ -944,19 +952,16 @@ def _drive_until_exit(driver, app) -> int:
 
 
 def run_backtest(args) -> int:
-    try:
-        app, code = _boot(HeadlessPolicy(accept_data_range=True), need_com=(args.source == "api"))
-        if app is None:
-            return code
-        driver = BacktestDriver(app, args)
-        driver.start()
-        if driver.exit_code is None:
-            app.root.mainloop()
-        code = driver.report()
-        _teardown(app)
+    app, code = _boot(HeadlessPolicy(accept_data_range=True), need_com=(args.source == "api"))
+    if app is None:
         return code
-    finally:
-        rb.note_return_from_main()
+    driver = BacktestDriver(app, args)
+    driver.start()
+    if driver.exit_code is None:
+        app.root.mainloop()
+    code = driver.report()
+    _teardown(app)
+    return code
 
 
 def _teardown(app: HeadlessBotApp) -> None:

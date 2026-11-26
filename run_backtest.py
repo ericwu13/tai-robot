@@ -1229,6 +1229,13 @@ _APP_LOG_NAMES = (
     "src.live.regime_switching_runner",
     "src.live.tick_watchdog",
     "src.market_data.holidays",
+    "src.live.quote_stuck_recovery",
+    "src.live.host_stall",
+    "src.live.main_heartbeat",
+    "src.live.loss_baseline",
+    "src.live.position_log",
+    "src.live.degraded_restart",
+    "src.live.leftover_sweep",
 )
 
 
@@ -1276,18 +1283,28 @@ def _log_debug(msg):
     _route_to_log_widget(line, "debug")
 
 
+_COM_CODE_NAMES = ("EnterMonitorLONG", "LoginSetQuote", "LeaveMonitor")
+_last_is_connected = None
+
+
 def _log_com_return(name: str, elapsed_ms: float, failed: bool, code=None) -> None:
-    """P0 duration, plus the EnterMonitorLONG code on the #178 path.
+    """P0 duration. Selected SKCOM codes are a suffix on that one line.
 
     Logging only. The caller already invoked the COM method; this does
     not make another one and does not branch on the elapsed time or the
-    code. ``code`` is omitted when the call raised, and for every name
-    other than EnterMonitorLONG.
+    code. ``code`` is omitted when the call raised. Names in
+    ``_COM_CODE_NAMES`` always include it. IsConnected includes it only
+    when the value changes. Every other name stays duration-only.
     """
+    global _last_is_connected
     status = "raised" if failed else "returned"
     detail = ""
-    if name == "EnterMonitorLONG" and code is not None and not failed:
-        detail = f" code={code}"
+    if code is not None and not failed:
+        if name in _COM_CODE_NAMES:
+            detail = f" code={code}"
+        elif name == "IsConnected" and code != _last_is_connected:
+            _last_is_connected = code
+            detail = f" code={code}"
     _log_debug(
         f"[COM] {name} {status} in {elapsed_ms:.0f} ms{detail} "
         f"tid={threading.get_ident()}")
@@ -13975,14 +13992,39 @@ def release_com_connections() -> None:
     _safe_log(f"[HEADLESS] COM disconnect ok={ok}")
 
 
+# Set when this process booted a bot, the GUI, or COM. list/status do not.
+_process_booted = False
+
+
+def _mark_process_booted() -> None:
+    """Record a boot on every loaded copy of this module.
+
+    ``python run_backtest.py`` is ``__main__`` and is imported again as
+    ``run_backtest`` once headless starts, so one assignment would miss
+    the copy that logs the return.
+    """
+    global _process_booted
+    _process_booted = True
+    for name in ("run_backtest", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "_process_booted"):
+            mod._process_booted = True
+
+
 def note_return_from_main() -> None:
-    """Log that main is returning. The hang dump stays armed."""
+    """Log that main is returning. Silent unless this process booted.
+
+    The hang dump is not touched here.
+    """
+    if not _process_booted:
+        return
     _safe_log("[HEADLESS] return from main")
 
 
 def main():
     # First: COM init and Tk both create (hidden) windows, and DPI
     # awareness can only be set before the process owns any window.
+    _mark_process_booted()
     enable_dpi_awareness()
     _init_com()
     register_com_events()
@@ -14006,9 +14048,11 @@ if __name__ == "__main__":
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
-        # list/status --json must stay valid JSON. The exit log is
-        # inside run_deploy / run_backtest, after a bot or COM boot.
-        sys.exit(run_bot_cli.main(routed))
+        _code = run_bot_cli.main(routed)
+        # No-op unless _boot or GUI main set the flag, so list/status
+        # --json stays valid JSON.
+        note_return_from_main()
+        sys.exit(_code)
     if kind != "gui":
         raise SystemExit(0)
     main()

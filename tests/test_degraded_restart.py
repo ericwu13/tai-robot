@@ -9,6 +9,7 @@ does not restart again. ``semi_auto`` alerts only.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -635,6 +636,151 @@ def test_alert_only_sends_one_discord_and_does_not_stop(tmp_path, monkeypatch):
     reasons = [note["reason"] for note in driver._discord.skipped]
     assert reasons.count("already_restarted") == 1
     assert driver._pending_restart_cmd is None
+
+
+def _policy_lines(logs) -> list[str]:
+    return [line for line in logs if "degraded-restart policy:" in line]
+
+
+def test_policy_outcome_logged_once_per_change(tmp_path, monkeypatch):
+    """Noop/clock_started, Noop/waiting, and Defer/fill_pending each log once."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    app._trading_guard.fill_pending = False
+
+    driver._poll_once()
+    for _ in range(3):
+        driver._poll_once()
+    lines = _policy_lines(logs)
+    assert sum("Noop/clock_started" in line for line in lines) == 1
+    assert sum("Noop/waiting" in line for line in lines) == 1
+    assert all("mode=paper" in line for line in lines)
+
+    _arm(driver._restart_policy)
+    app._trading_guard.fill_pending = True
+    for _ in range(3):
+        driver._poll_once()
+    lines = _policy_lines(logs)
+    assert sum("Defer/fill_pending" in line for line in lines) == 1
+    assert sum("Noop/clock_started" in line for line in lines) == 1
+    assert sum("Noop/waiting" in line for line in lines) == 1
+
+
+def test_not_degraded_is_silent_and_rearms(tmp_path, monkeypatch):
+    """not_degraded logs nothing and lets the next episode log clock_started."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    flag = {"degraded": False}
+    app._link_host = SimpleNamespace(
+        snapshot=lambda: {"degraded": flag["degraded"]})
+
+    driver._poll_once()
+    driver._poll_once()
+    assert _policy_lines(logs) == []
+
+    flag["degraded"] = True
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+
+    flag["degraded"] = False
+    driver._poll_once()
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+    assert all("not_degraded" not in line for line in _policy_lines(logs))
+
+    flag["degraded"] = True
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 2
+
+
+def test_restart_decision_adds_no_extra_policy_line(tmp_path, monkeypatch):
+    """RestartDecision keeps the existing restart line and adds no policy line.
+
+    The clock_started line has to be present first: on master a restart
+    poll already logged only that existing line, so this test would pass
+    there without the new policy logger.
+    """
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    app._trading_guard.fill_pending = False
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+
+    _arm(driver._restart_policy)
+    marked = len(logs)
+    driver._poll_once()
+    fresh = logs[marked:]
+    assert any("degraded auto-restart session=" in line for line in fresh)
+    assert not any("degraded-restart policy:" in line for line in fresh)
+
+
+def test_snapshot_exception_logged_once_by_type(caplog):
+    """A snapshot failure logs the exception type once, never the message."""
+    dr._snapshot_error = None
+    secret = "do-not-log-this-snapshot-message"
+    calls = {"n": 0}
+
+    def snap():
+        calls["n"] += 1
+        n = calls["n"]
+        if n <= 3:
+            raise RuntimeError(secret)
+        if n == 4:
+            raise ValueError(secret)
+        if n == 5:
+            return {"degraded": True}
+        raise RuntimeError(secret)
+
+    app = _app_view()
+    app._link_host.snapshot = snap
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.live.degraded_restart"):
+            assert dr._snapshot_degraded(app) is False
+            assert dr._snapshot_degraded(app) is False
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 1
+            assert "RuntimeError" in logged[0].getMessage()
+            assert secret not in logged[0].getMessage()
+            assert logged[0].exc_info is None
+
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 2
+            assert "ValueError" in logged[1].getMessage()
+            assert secret not in logged[1].getMessage()
+
+            assert dr._snapshot_degraded(app) is True
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 3
+            assert "RuntimeError" in logged[2].getMessage()
+
+            outcome = _Clock().policy().observe_app(app, bot_dir="unused")
+            assert outcome == dr.Noop("not_degraded")
+            assert len(_snapshot_records(caplog)) == 3
+    finally:
+        dr._snapshot_error = None
+
+
+def _snapshot_records(caplog):
+    return [
+        rec for rec in caplog.records
+        if rec.name == "src.live.degraded_restart"
+        and rec.levelno == logging.WARNING
+    ]
 
 
 # ── run_deploy lifecycle ─────────────────────────────────────────────
@@ -1958,7 +2104,12 @@ def test_shutdown_arms_dump_and_return_from_main_does_not_cancel(
         app._shutdown_link()
         assert order == ["leave", "dump", "disc"]
         assert dumps == [(30, False, True)] and "cancel" not in order
-        note_return_from_main()
+        saved_boot = rb._process_booted
+        rb._process_booted = True
+        try:
+            note_return_from_main()
+        finally:
+            rb._process_booted = saved_boot
         assert "cancel" not in order
         assert "return from main" in capsys.readouterr().out
         order.clear()
