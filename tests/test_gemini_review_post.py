@@ -172,18 +172,78 @@ class TestThreadIsolationAndApply:
         # Tokenless review job (app_slug="") still sees App-bot threads with marker, not human spoofs
         assert mod._is_gemini_thread("tai-robot-gemini[bot]", f"**P2:** bug\n{mod.THREAD_MARKER}", app_slug="") is True
         assert mod._is_gemini_thread("random-human", f"**P2:** bug\n{mod.THREAD_MARKER}", app_slug="") is False
+        # Bare slug is not a REST author, and a GraphQL User with that login is not a bot.
+        assert "tai-robot-gemini" not in mod.bot_logins("tai-robot-gemini")
+        assert mod.bot_logins("tai-robot-gemini") == frozenset({
+            "github-actions[bot]", "tai-robot-gemini[bot]",
+        })
+        assert mod._is_gemini_thread(
+            "tai-robot-gemini", "**P2:** bug", app_slug="tai-robot-gemini",
+        ) is False
+        assert mod._is_gemini_thread(
+            "tai-robot-gemini", "**P2:** bug", app_slug="tai-robot-gemini", typename="User",
+        ) is False
+        assert mod._is_gemini_thread(
+            "tai-robot-gemini", "**P2:** own", app_slug="tai-robot-gemini", typename="Bot",
+        ) is True
+        assert mod._is_gemini_thread(
+            "github-actions", f"**P2:** old\n{mod.THREAD_MARKER}",
+            app_slug="tai-robot-gemini", typename="Bot",
+        ) is True
+        assert mod._is_gemini_thread(
+            "github-actions", f"**P2:** old\n{mod.THREAD_MARKER}",
+            app_slug="tai-robot-gemini", typename="User",
+        ) is False
 
     def test_tokenless_reuse_sees_app_bot_summary_and_ignores_human_spoof(self):
         marker = '<!-- gemini-review-state: {"diff": "aabbcc", "verdict": "PASS", "head": "1234567"} -->'
         fake_comments = [
             {"id": 1, "user": {"login": "random-human"}, "body": f"## Gemini review\n{marker}"},
             {"id": 2, "user": {"login": "tai-robot-gemini[bot]"}, "body": f"## Gemini review\n{marker}"},
+            {"id": 3, "user": {"login": "tai-robot-gemini"}, "body": f"## Gemini review\n{marker}"},
         ]
         with mock.patch.object(mod, "gh_api", return_value=(True, fake_comments)):
-            cid, _body, author = mod.latest_summary_with_author("o/r", 50, app_slug="")
+            cid, _body, author = mod.latest_summary_with_author("o/r", 50, app_slug="tai-robot-gemini")
         assert cid == 2 and author == "tai-robot-gemini[bot]"
+        only_bare = [fake_comments[2]]
+        with mock.patch.object(mod, "gh_api", return_value=(True, only_bare)):
+            cid, _body, author = mod.latest_summary_with_author("o/r", 50, app_slug="tai-robot-gemini")
+        assert cid is None and author == ""
 
-    def test_apply_review_resolves_fixed_threads_and_approves(self, tmp_path):
+    def test_graphql_user_slug_is_not_a_thread_and_actions_bot_is(self):
+        assert mod.THREADS_QUERY.count("__typename") >= 2
+        marked = f"**P2:** old\n{mod.THREAD_MARKER}"
+
+        def node(tid, login, typename, body):
+            return {
+                "id": tid, "isResolved": False, "path": "a.py", "line": 1,
+                "comments": {"nodes": [{
+                    "author": {"login": login, "__typename": typename},
+                    "body": body,
+                }]},
+                "replies": {"nodes": [{
+                    "author": {"login": "tai-robot-gemini", "__typename": "User"},
+                    "body": "human reply",
+                }]},
+            }
+
+        payload = {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False, "endCursor": None},
+            "nodes": [
+                node("USER", "tai-robot-gemini", "User", "**P2:** spoof"),
+                node("ACTIONS", "github-actions", "Bot", marked),
+                node("OWN", "tai-robot-gemini", "Bot", "**P2:** own"),
+            ],
+        }}}}
+        with mock.patch.object(mod, "graphql", return_value=payload):
+            gemini, other = mod.list_review_threads("o/r", 50, app_slug="tai-robot-gemini")
+        ids = {t["id"] for t in gemini}
+        assert ids == {"ACTIONS", "OWN"}
+        assert {t["author"] for t in other} == {"tai-robot-gemini"}
+        actions = next(t for t in gemini if t["id"] == "ACTIONS")
+        assert actions["replies"] == [{"author": "tai-robot-gemini", "body": "human reply"}]
+
+    def test_apply_review_queues_threads_and_approves(self, tmp_path, monkeypatch):
         res_file = tmp_path / "result.txt"
         ctx_file = tmp_path / "context.json"
         ctx_file.write_text(
@@ -212,6 +272,8 @@ class TestThreadIsolationAndApply:
                 return True, []
             return True, {}
 
+        out_file = tmp_path / "github_output.txt"
+        monkeypatch.setenv("GITHUB_OUTPUT", str(out_file))
         with mock.patch.object(mod, "list_review_threads", return_value=([{"id": "PRRT_FIXED"}], [])), \
              mock.patch.object(mod, "graphql", side_effect=fake_gql), \
              mock.patch.object(mod, "gh_api", side_effect=fake_api):
@@ -220,13 +282,36 @@ class TestThreadIsolationAndApply:
                 diff_h="11223344", model_name="gemini-4-neon", app_slug="tai-robot-gemini",
             )
 
-        assert out == {"verdict": "PASS", "action": "created", "resolved": 1, "failed_inline": 0}
-        assert any("resolveReviewThread" in q and v == {"t": "PRRT_FIXED"} for q, v in gql_calls)
+        assert out["verdict"] == "PASS" and out["action"] == "created" and out["failed_inline"] == 0
+        assert out["resolve_ids"] == ["PRRT_FIXED"]
+        assert not any("resolveReviewThread" in q for q, _v in gql_calls)
+        assert "resolve_ids=" in out_file.read_text(encoding="utf-8")
         reviews = [p for m, u, p in rest_calls if m == "POST" and u == "repos/o/r/pulls/50/reviews"]
         assert len(reviews) == 1 and reviews[0]["event"] == "APPROVE"
         comments = [p for m, u, p in rest_calls if m == "POST" and u == "repos/o/r/issues/50/comments"]
         assert len(comments) == 1 and "<!-- gemini-review-state:" in comments[0]["body"]
         assert "gemini-4-neon" in comments[0]["body"]
+
+    def test_resolve_failure_exits_nonzero_and_does_not_approve(self, capsys, monkeypatch):
+        monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+        monkeypatch.setenv("PR", "50")
+        monkeypatch.setenv("HEAD_SHA", "abc1234deadbeef")
+        monkeypatch.setenv("IDS", '["PRRT_FIXED"]')
+        monkeypatch.setenv("APP_SLUG", "tai-robot-gemini")
+
+        def fake_gql(q, v):
+            if "resolveReviewThread" in q:
+                raise RuntimeError("Resource not accessible by integration")
+            return {}
+
+        with mock.patch.object(mod, "list_review_threads", return_value=([{"id": "PRRT_FIXED"}], [])), \
+             mock.patch.object(mod, "graphql", side_effect=fake_gql), \
+             mock.patch.object(mod, "submit_review") as submit:
+            rc = mod.main(["resolve"])
+
+        assert rc != 0
+        assert "::error::" in capsys.readouterr().out
+        assert submit.call_count == 0
 
 
 class TestWorkflowSecurityInvariants:
@@ -234,8 +319,12 @@ class TestWorkflowSecurityInvariants:
         wf = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
         review_job = wf["jobs"]["gemini-review"]
         post_job = wf["jobs"]["gemini-post"]
-        assert set(wf["jobs"]) == {"gemini-review", "gemini-post"}
+        resolve_job = wf["jobs"]["gemini-resolve-threads"]
+        assert set(wf["jobs"]) == {"gemini-review", "gemini-post", "gemini-resolve-threads"}
         assert post_job["needs"] == "gemini-review"
+        assert resolve_job["needs"] == "gemini-post"
+        assert resolve_job["permissions"] == {"contents": "write", "pull-requests": "write"}
+        assert post_job["permissions"]["contents"] == "read"
 
         assert review_job["permissions"] == {"contents": "read", "pull-requests": "read"}
         assert post_job["permissions"] == {
@@ -290,6 +379,27 @@ class TestWorkflowSecurityInvariants:
         assert len(uploads) == 1 and len(downloads) == 1
         assert uploads[0]["with"]["name"] == downloads[0]["with"]["name"]
         assert uploads[0]["with"]["path"] == downloads[0]["with"]["path"]
+
+        assert post_job["outputs"]["app_slug"] == "${{ steps.app-token.outputs.app-slug }}"
+        assert post_job["outputs"]["resolve_ids"] == "${{ steps.apply.outputs.resolve_ids }}"
+        apply_step = next(s for s in post_job["steps"] if s.get("id") == "apply")
+        assert "gemini_review_post.py apply" in str(apply_step.get("run"))
+        post_runs = "\n".join(str(s.get("run") or "") for s in post_job["steps"])
+        resolve_runs = "\n".join(str(s.get("run") or "") for s in resolve_job["steps"])
+        assert 'gemini_review_post.py" resolve' not in post_runs
+        assert 'gemini_review_post.py" resolve' in resolve_runs
+        resolve_env = resolve_job["steps"][0]["env"]
+        assert resolve_env["GH_TOKEN"] == "${{ github.token }}"
+        assert resolve_env["APP_SLUG"] == "${{ needs.gemini-post.outputs.app_slug }}"
+        assert resolve_env["IDS"] == "${{ needs.gemini-post.outputs.resolve_ids }}"
+        resolve_dump = yaml.dump(resolve_job)
+        assert "GEMINI_API_KEY" not in resolve_dump
+        assert "secrets." not in resolve_dump
+        assert "create-github-app-token" not in resolve_dump
+        assert not any(
+            str(s.get("uses", "")).startswith("actions/create-github-app-token@")
+            for s in resolve_job["steps"]
+        )
 
     def test_only_claude_review_and_test_own_required_check_names(self):
         """Required master contexts are `review` and `test`.

@@ -16,13 +16,19 @@
         any P1/P2, inline finding, or kept open thread forces BLOCK), submit a
         native GitHub App PR review (`APPROVE` on PASS, `COMMENT` on
         BLOCK when APP_SLUG is set; `COMMENT`-only fallback under github.token),
-        upsert a single edit-in-place summary comment, and resolve Gemini's own
-        threads that were fixed.
+        upsert a single edit-in-place summary comment, and write the thread
+        ids the resolve job should close to $GITHUB_OUTPUT. It does not
+        resolve threads (that needs contents: write).
 
     python .github/scripts/gemini_review_post.py carry-over
         Carry over an unchanged-diff verdict onto the new HEAD_SHA: update the
         summary comment note and (when APP_SLUG is set) submit APPROVE /
         COMMENT at the new commit SHA.
+
+    python .github/scripts/gemini_review_post.py resolve
+        Resolve the ids in $IDS after re-checking each is still an open
+        Gemini thread. A failed resolve prints ::error:: and exits non-zero.
+        This command does not submit a PR review.
 
 Env: GITHUB_REPOSITORY, PR, HEAD_SHA, GH_TOKEN (+ BASE, DIFF_HASH, APP_SLUG,
 GEMINI_MODEL, RUN_URL, REUSED_VERDICT). Stdlib and `gh`/`git` only.
@@ -41,7 +47,6 @@ from typing import Any
 STATE_MARKER_RE = re.compile(r"<!-- gemini-review-state: (\{.*?\}) -->")
 CARRY_RE = re.compile(r"\n?<sub>Carried over to [^<]*</sub>")
 THREAD_MARKER = "<!-- gemini-review-thread -->"
-BOT_LOGINS = frozenset({"github-actions", "github-actions[bot]"})
 MAX_DIFF_CHARS = 60_000
 MAX_PR_BODY_CHARS = 8_000
 MAX_SUMMARY_CHARS = 24_000
@@ -54,8 +59,8 @@ query($owner:String!, $name:String!, $pr:Int!, $after:String) {
         pageInfo { hasNextPage endCursor }
         nodes {
           id isResolved path line
-          comments(first:1) { nodes { author { login } body url } }
-          replies: comments(last:10) { totalCount nodes { author { login } body } }
+          comments(first:1) { nodes { author { login __typename } body url } }
+          replies: comments(last:10) { totalCount nodes { author { login __typename } body } }
         }
       }
     }
@@ -71,21 +76,38 @@ def parse_pr_number(raw: str) -> int:
     return int(text)
 
 
-def bot_logins(app_slug: str | None = None) -> frozenset[str]:
+def _slug_base(app_slug: str | None) -> str:
     slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
-    logins = set(BOT_LOGINS)
-    if slug:
-        base = slug[:-5] if slug.endswith("[bot]") else slug
-        logins.update({base, f"{base}[bot]"})
+    if slug.endswith("[bot]"):
+        slug = slug[:-5]
+    return slug
+
+
+def bot_logins(app_slug: str | None = None) -> frozenset[str]:
+    """REST ``user.login`` values: ``github-actions[bot]`` and ``{slug}[bot]`` only."""
+    logins = {"github-actions[bot]"}
+    base = _slug_base(app_slug)
+    if base:
+        logins.add(f"{base}[bot]")
     return frozenset(logins)
 
 
 def actor_logins(app_slug: str | None = None) -> frozenset[str]:
-    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
-    if slug:
-        base = slug[:-5] if slug.endswith("[bot]") else slug
-        return frozenset({base, f"{base}[bot]"})
-    return BOT_LOGINS
+    """REST authors this token may edit. Never a bare slug."""
+    base = _slug_base(app_slug)
+    if base:
+        return frozenset({f"{base}[bot]"})
+    return frozenset({"github-actions[bot]"})
+
+
+def _graphql_bot(login: str, typename: str, app_slug: str | None = None) -> bool:
+    """A bare GraphQL login counts only when ``__typename`` is ``Bot``."""
+    if typename != "Bot":
+        return False
+    if login in {"github-actions", "github-actions[bot]"}:
+        return True
+    base = _slug_base(app_slug)
+    return bool(base) and login in {base, f"{base}[bot]"}
 
 
 def gh_api(path: str, *, method: str = "GET", payload: Any = None) -> tuple[bool, Any]:
@@ -118,23 +140,42 @@ def graphql(query: str, variables: dict[str, Any]) -> dict[str, Any]:
     return data["data"]
 
 
-def _is_gemini_thread(login: str, first_body: str, app_slug: str | None = None) -> bool:
-    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
-    if slug:
-        base = slug[:-5] if slug.endswith("[bot]") else slug
-        if login in {base, f"{base}[bot]"}:
+def _is_gemini_thread(
+    login: str,
+    first_body: str,
+    app_slug: str | None = None,
+    typename: str | None = None,
+) -> bool:
+    """Gemini's own review thread.
+
+    REST authors are only ``{slug}[bot]`` (and ``github-actions[bot]`` when
+    the body carries the marker). A GraphQL ``author.login`` is the bare
+    slug or ``github-actions``; that form counts only when ``typename`` is
+    ``Bot``. A User with the same login is never trusted.
+    """
+    body = first_body or ""
+    base = _slug_base(app_slug)
+    if typename is not None:
+        if typename != "Bot":
+            return False
+        if base and login in {base, f"{base}[bot]"}:
             return True
-        return login in BOT_LOGINS and THREAD_MARKER in (first_body or "")
-    # Read-only review job has no App token/slug: recognize any bot thread
-    # stamped with THREAD_MARKER (excludes humans, Claude, and Reed).
-    is_bot = login in BOT_LOGINS or login.endswith("[bot]")
-    return is_bot and THREAD_MARKER in (first_body or "")
+        if login in {"github-actions", "github-actions[bot]"}:
+            return THREAD_MARKER in body
+        # Tokenless collect: GraphQL shows the App as a bare Bot login.
+        return (not base) and THREAD_MARKER in body
+    if base and login == f"{base}[bot]":
+        return True
+    if login == "github-actions[bot]":
+        return THREAD_MARKER in body
+    if not base and login.endswith("[bot]"):
+        return THREAD_MARKER in body
+    return False
 
 
 def list_review_threads(repo: str, pr: int, *, app_slug: str | None = None) -> tuple[list[dict], list[dict]]:
     """Return ``(gemini_open_threads, other_open_threads)``."""
     owner, name = repo.split("/", 1)
-    known = bot_logins(app_slug)
     gemini_threads: list[dict] = []
     other_threads: list[dict] = []
     after = None
@@ -147,18 +188,28 @@ def list_review_threads(repo: str, pr: int, *, app_slug: str | None = None) -> t
             if t.get("isResolved"):
                 continue
             first = (t["comments"]["nodes"] or [{}])[0]
-            login = str((first.get("author") or {}).get("login") or "")
+            author = first.get("author") or {}
+            login = str(author.get("login") or "")
             body = str(first.get("body") or "")
-            if _is_gemini_thread(login, body, app_slug):
+            typename = str(author["__typename"]) if "__typename" in author else None
+            if _is_gemini_thread(login, body, app_slug, typename):
                 replies_nodes = (t.get("replies") or {}).get("nodes") or []
-                replies = [
-                    {
-                        "author": str((n.get("author") or {}).get("login") or ""),
+                replies = []
+                for n in replies_nodes:
+                    na = n.get("author") or {}
+                    nlogin = str(na.get("login") or "")
+                    ntype = str(na["__typename"]) if "__typename" in na else None
+                    if nlogin == login:
+                        continue
+                    if ntype is None and nlogin in bot_logins(app_slug):
+                        continue
+                    if ntype is not None and _graphql_bot(nlogin, ntype, app_slug):
+                        continue
+                    replies.append({
+                        "author": nlogin,
                         "body": str(n.get("body") or "")[:1500],
-                    }
-                    for n in replies_nodes
-                    if str((n.get("author") or {}).get("login") or "") not in (known | {login})
-                ][-3:]
+                    })
+                replies = replies[-3:]
                 gemini_threads.append({
                     "id": t["id"],
                     "path": t.get("path"),
@@ -191,7 +242,7 @@ def latest_summary_with_author(repo: str, pr: int, *, app_slug: str | None = Non
             continue
         login = str((c.get("user") or {}).get("login") or "")
         body = str(c.get("body") or "")
-        allowed_author = (login in known) if slug else (login in BOT_LOGINS or login.endswith("[bot]"))
+        allowed_author = (login in known) if slug else login.endswith("[bot]")
         if allowed_author and STATE_MARKER_RE.search(body):
             cid = c.get("id")
             if isinstance(cid, int):
@@ -491,27 +542,46 @@ def submit_review(
     return failed
 
 
+def _select_resolve_ids(
+    shown_ids: list[str],
+    open_threads: list[dict],
+    still_open: list[str],
+) -> list[str]:
+    open_ids = {str(t["id"]) for t in open_threads if isinstance(t, dict) and t.get("id")}
+    keep = {str(i) for i in still_open}
+    return [str(tid) for tid in shown_ids if str(tid) in open_ids and str(tid) not in keep]
+
+
+def _append_output(name: str, value: str) -> None:
+    path = os.environ.get("GITHUB_OUTPUT", "").strip()
+    if not path:
+        return
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(f"{name}={value}\n")
+
+
 def resolve_gemini_threads(
     repo: str,
     pr: int,
     head_sha: str,
-    shown_ids: list[str],
-    still_open: list[str],
+    ids: list[str],
     *,
     app_slug: str | None = None,
-) -> tuple[int, int]:
-    if not shown_ids:
-        return 0, 0
+) -> int:
+    """Resolve ``ids``. Exit 1 when a resolve call fails. Never submits a review."""
+    if not ids:
+        return 0
     try:
         gemini_threads, _ = list_review_threads(repo, pr, app_slug=app_slug)
     except RuntimeError as exc:
-        print(f"could not re-check Gemini threads for resolution: {exc}")
-        return 0, 0
+        print(f"::error::could not list Gemini threads for resolution: {exc}")
+        return 1
     open_ids = {str(t["id"]) for t in gemini_threads}
-    keep = set(still_open)
-    todo = [tid for tid in shown_ids if tid in open_ids and tid not in keep]
-    done = failed = 0
-    for tid in todo:
+    failed = 0
+    for tid in ids:
+        if tid not in open_ids:
+            print(f"skip {tid}: not an open Gemini thread")
+            continue
         try:
             graphql(
                 "mutation($t:ID!){resolveReviewThread(input:{threadId:$t}){thread{isResolved}}}",
@@ -519,9 +589,8 @@ def resolve_gemini_threads(
             )
         except RuntimeError as exc:
             failed += 1
-            print(f"::warning::could not resolve {tid}: {exc}")
+            print(f"::error::could not resolve {tid}: {exc}")
             continue
-        done += 1
         try:
             graphql(
                 "mutation($t:ID!,$b:String!){addPullRequestReviewThreadReply("
@@ -534,7 +603,10 @@ def resolve_gemini_threads(
             )
         except RuntimeError as exc:
             print(f"resolved {tid} but could not reply: {exc}")
-    return done, failed
+    if failed:
+        print(f"::error::{failed} Gemini thread(s) could not be resolved")
+        return 1
+    return 0
 
 
 def upsert_summary(
@@ -591,9 +663,15 @@ def apply_review(
         except (OSError, ValueError, TypeError):
             shown_ids = []
 
-    resolved, _res_failed = resolve_gemini_threads(
-        repo, pr, head_sha, shown_ids, parsed["still_open_threads"], app_slug=app_slug,
-    )
+    try:
+        open_threads, _ = list_review_threads(repo, pr, app_slug=app_slug)
+        resolve_ids = _select_resolve_ids(
+            shown_ids, open_threads, parsed["still_open_threads"],
+        )
+    except RuntimeError as exc:
+        print(f"could not list Gemini threads; the resolve job will re-check: {exc}")
+        keep = {str(i) for i in parsed["still_open_threads"]}
+        resolve_ids = [s for s in shown_ids if s not in keep]
     comments = parsed["inline_comments"]
     failed = submit_review(
         repo, pr, head_sha, parsed["verdict"], comments, app_slug=app_slug,
@@ -613,7 +691,7 @@ def apply_review(
         f"P1 {parsed['p1']} | P2 {parsed['p2']} | P3 {parsed['p3']}",
         f"head `{head_sha[:7]}`",
         f"inline {len(comments) - len(failed)}/{len(comments)}",
-        f"threads resolved {resolved}, kept {len(parsed['still_open_threads'])}",
+        f"threads to resolve {len(resolve_ids)}, kept {len(parsed['still_open_threads'])}",
     ]
     if model_name:
         footer_bits.append(f"model `{model_name}`")
@@ -629,7 +707,13 @@ def apply_review(
     cid, _prev_body, prev_author = latest_summary_with_author(repo, pr, app_slug=app_slug)
     action = upsert_summary(repo, pr, full_body, cid, prev_author, app_slug=app_slug)
     print(f"Gemini review {action} on PR #{pr}: verdict={parsed['verdict']} inline={len(comments) - len(failed)}/{len(comments)}")
-    return {"verdict": parsed["verdict"], "action": action, "resolved": resolved, "failed_inline": len(failed)}
+    _append_output("resolve_ids", json.dumps(resolve_ids))
+    return {
+        "verdict": parsed["verdict"],
+        "action": action,
+        "resolve_ids": resolve_ids,
+        "failed_inline": len(failed),
+    }
 
 
 def carry_over(repo: str, pr: int, head_sha: str, verdict: str, *, app_slug: str | None = None) -> None:
@@ -647,7 +731,7 @@ def carry_over(repo: str, pr: int, head_sha: str, verdict: str, *, app_slug: str
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
-        print("usage: gemini_review_post.py <reuse|collect|apply|carry-over> ...", file=sys.stderr)
+        print("usage: gemini_review_post.py <reuse|collect|apply|carry-over|resolve> ...", file=sys.stderr)
         return 2
     mode = args[0]
     repo = os.environ.get("GITHUB_REPOSITORY", "").strip()
@@ -677,6 +761,19 @@ def main(argv: list[str] | None = None) -> int:
         verdict = os.environ.get("REUSED_VERDICT", "").strip().upper()
         if verdict in ("PASS", "BLOCK") and head_sha:
             carry_over(repo, pr, head_sha, verdict)
+    elif mode == "resolve":
+        try:
+            raw_ids = json.loads(os.environ.get("IDS") or "[]")
+        except ValueError:
+            print("IDS must be a JSON list", file=sys.stderr)
+            return 2
+        if not isinstance(raw_ids, list):
+            print("IDS must be a JSON list", file=sys.stderr)
+            return 2
+        return resolve_gemini_threads(
+            repo, pr, head_sha, [str(i) for i in raw_ids],
+            app_slug=os.environ.get("APP_SLUG", ""),
+        )
     else:
         print(f"unknown mode/args: {args!r}", file=sys.stderr)
         return 2
