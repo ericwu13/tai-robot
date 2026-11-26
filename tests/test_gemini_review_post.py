@@ -25,6 +25,21 @@ def _load_mod():
 mod = _load_mod()
 
 
+def _output_refs(text: str, prefix: str) -> set[str]:
+    found = set()
+    start = 0
+    while True:
+        i = text.find(prefix, start)
+        if i < 0:
+            return found
+        j = i + len(prefix)
+        k = j
+        while k < len(text) and (text[k].isalnum() or text[k] == "_"):
+            k += 1
+        found.add(text[j:k])
+        start = k
+
+
 class TestNormalizationAndConsistency:
     def test_pass_with_zero_findings(self):
         out = mod.normalize_review_result({
@@ -73,7 +88,7 @@ class TestNativeReviewSubmission:
         assert calls[0][2]["event"] == "APPROVE"
         assert calls[0][2]["commit_id"] == "deadbeef1234"
 
-    def test_app_block_submits_request_changes_and_tags_inline_threads(self):
+    def test_app_block_submits_comment_and_tags_inline_threads(self):
         calls = []
 
         def fake_api(path, *, method="GET", payload=None):
@@ -85,10 +100,30 @@ class TestNativeReviewSubmission:
             failed = mod.submit_review("o/r", 50, "deadbeef1234", "BLOCK", comments, app_slug="tai-robot-gemini")
 
         assert failed == []
-        assert calls[0]["event"] == "REQUEST_CHANGES"
+        assert calls[0]["event"] == "COMMENT"
+        assert "BLOCK" in calls[0]["body"]
         assert mod.THREAD_MARKER in calls[0]["comments"][0]["body"]
 
-    def test_app_block_422_retries_inline_and_still_requests_changes(self):
+    @pytest.mark.parametrize("verdict", ["BLOCK", "FAIL", "CHANGES", ""])
+    def test_non_pass_never_sends_request_changes(self, verdict):
+        calls = []
+
+        def fake_api(path, *, method="GET", payload=None):
+            calls.append(payload)
+            if len(calls) == 1 and payload.get("comments"):
+                return False, "422 Unprocessable Entity"
+            return True, {}
+
+        comments = [{"path": "src/a.py", "line": 42, "body": "**P2:** race"}]
+        with mock.patch.object(mod, "gh_api", side_effect=fake_api):
+            mod.submit_review("o/r", 50, "deadbeef1234", verdict, comments, app_slug="tai-robot-gemini")
+
+        assert calls
+        assert all(c.get("event") != "REQUEST_CHANGES" for c in calls)
+        assert all(c.get("event") == "COMMENT" for c in calls)
+        assert "BLOCK" in calls[-1]["body"]
+
+    def test_app_block_422_retries_inline_and_still_comments(self):
         calls = []
 
         def fake_api(path, *, method="GET", payload=None):
@@ -107,7 +142,8 @@ class TestNativeReviewSubmission:
             failed = mod.submit_review("o/r", 50, "deadbeef", "BLOCK", comments, app_slug="tai-robot-gemini")
 
         assert len(failed) == 1 and failed[0]["line"] == 999
-        assert calls[-1]["event"] == "REQUEST_CHANGES"
+        assert calls[-1]["event"] == "COMMENT"
+        assert "REQUEST_CHANGES" not in {c.get("event") for c in calls}
 
     def test_without_app_slug_falls_back_to_comment_only(self):
         calls = []
@@ -195,8 +231,10 @@ class TestThreadIsolationAndApply:
 class TestWorkflowSecurityInvariants:
     def test_workflow_privilege_separation_pinned_sha_and_readonly_tools(self):
         wf = yaml.safe_load(WORKFLOW_PATH.read_text(encoding="utf-8"))
-        review_job = wf["jobs"]["review"]
-        post_job = wf["jobs"]["post"]
+        review_job = wf["jobs"]["gemini-review"]
+        post_job = wf["jobs"]["gemini-post"]
+        assert set(wf["jobs"]) == {"gemini-review", "gemini-post"}
+        assert post_job["needs"] == "gemini-review"
 
         assert review_job["permissions"] == {"contents": "read", "pull-requests": "read"}
         assert post_job["permissions"] == {
@@ -212,6 +250,7 @@ class TestWorkflowSecurityInvariants:
         ref = step["uses"].split("@", 1)[1]
         assert len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
         assert step["env"]["GITHUB_TOKEN"] == ""
+        assert step["with"]["gemini_cli_version"] == "0.71.1"
         settings = json.loads(step["with"]["settings"])
         core_tools = set(settings["tools"]["core"])
         assert core_tools <= {"read_file", "read_many_files", "list_directory", "glob", "grep_search"}
@@ -229,3 +268,44 @@ class TestWorkflowSecurityInvariants:
         assert len(app_steps) == 1
         assert app_steps[0]["with"]["permission-pull-requests"] == "write"
         assert app_steps[0]["with"]["permission-contents"] == "read"
+
+        raw = WORKFLOW_PATH.read_text(encoding="utf-8")
+        assert "needs.review" not in raw
+        referenced = _output_refs(yaml.dump(post_job), "needs.gemini-review.outputs.")
+        assert referenced == set(review_job["outputs"])
+        uploads = [
+            s for s in review_job["steps"]
+            if str(s.get("uses", "")).startswith("actions/upload-artifact@")
+        ]
+        downloads = [
+            s for s in post_job["steps"]
+            if str(s.get("uses", "")).startswith("actions/download-artifact@")
+        ]
+        assert len(uploads) == 1 and len(downloads) == 1
+        assert uploads[0]["with"]["name"] == downloads[0]["with"]["name"]
+        assert uploads[0]["with"]["path"] == downloads[0]["with"]["path"]
+
+    def test_only_claude_review_and_test_own_required_check_names(self):
+        """Required master contexts are `review` and `test`.
+
+        A job's check run is the job `name:` when set, otherwise the job
+        key. Only claude-review.yml may equal `review` (it is the producer),
+        and only test.yml may equal `test`. An advisory workflow whose job
+        key is `review` would satisfy the required check on a no-op run.
+        """
+        review_owners: set[str] = set()
+        test_owners: set[str] = set()
+        workflows = sorted((REPO_ROOT / ".github" / "workflows").glob("*.yml"))
+        assert workflows, "expected workflow files"
+        for path in workflows:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            for key, cfg in (doc.get("jobs") or {}).items():
+                labels = {str(key)}
+                if isinstance(cfg, dict) and isinstance(cfg.get("name"), str):
+                    labels.add(cfg["name"].strip())
+                if "review" in labels:
+                    review_owners.add(path.name)
+                if "test" in labels:
+                    test_owners.add(path.name)
+        assert review_owners == {"claude-review.yml"}
+        assert test_owners == {"test.yml"}

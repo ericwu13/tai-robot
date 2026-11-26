@@ -14,7 +14,7 @@
     python .github/scripts/gemini_review_post.py apply RESULT_FILE
         Validate Gemini CLI's structured JSON output (fail-closed consistency:
         any P1/P2, inline finding, or kept open thread forces BLOCK), submit a
-        native GitHub App PR review (`APPROVE` on PASS, `REQUEST_CHANGES` on
+        native GitHub App PR review (`APPROVE` on PASS, `COMMENT` on
         BLOCK when APP_SLUG is set; `COMMENT`-only fallback under github.token),
         upsert a single edit-in-place summary comment, and resolve Gemini's own
         threads that were fixed.
@@ -22,7 +22,7 @@
     python .github/scripts/gemini_review_post.py carry-over
         Carry over an unchanged-diff verdict onto the new HEAD_SHA: update the
         summary comment note and (when APP_SLUG is set) submit APPROVE /
-        REQUEST_CHANGES at the new commit SHA.
+        COMMENT at the new commit SHA.
 
 Env: GITHUB_REPOSITORY, PR, HEAD_SHA, GH_TOKEN (+ BASE, DIFF_HASH, APP_SLUG,
 GEMINI_MODEL, RUN_URL, REUSED_VERDICT). Stdlib and `gh`/`git` only.
@@ -453,12 +453,12 @@ def submit_review(
     carried_over: bool = False,
     app_slug: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Submit native APPROVE / REQUEST_CHANGES when APP_SLUG is set, else COMMENT-only."""
+    """Submit APPROVE on PASS and COMMENT otherwise when APP_SLUG is set, else COMMENT-only."""
     slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
     if not slug:
         return post_inline_comments(repo, pr, head_sha, comments)
 
-    event = "APPROVE" if verdict == "PASS" else "REQUEST_CHANGES"
+    event = "APPROVE" if verdict == "PASS" else "COMMENT"
     path = f"repos/{repo}/pulls/{pr}/reviews"
     if verdict == "PASS":
         suffix = " (carried over: diff unchanged)" if carried_over else ""

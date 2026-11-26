@@ -219,6 +219,7 @@ class TestWorkflowSecurityInvariants:
         assert len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
         # No GitHub token exposed to LLM step
         assert step["env"]["GITHUB_TOKEN"] == ""
+        assert step["with"]["gemini_cli_version"] == "0.71.1"
         # Core tools strictly read-only
         settings = json.loads(step["with"]["settings"])
         core_tools = set(settings["tools"]["core"])
