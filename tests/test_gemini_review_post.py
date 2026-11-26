@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
+import subprocess
 from pathlib import Path
 from unittest import mock
 
@@ -425,3 +427,57 @@ class TestWorkflowSecurityInvariants:
                     test_owners.add(path.name)
         assert review_owners == {"claude-review.yml"}
         assert test_owners == {"test.yml"}
+
+
+_COLLECT_PATH_RE = re.compile(r"(?:^|\s)collect\s+(\S+)")
+_CONTEXT_PATH_RE = re.compile(
+    r"(?<![\w./-])((?:[\w.-]+/)+[\w.-]*_context\.json)"
+)
+_CONTEXT_WORKFLOWS = (
+    REPO_ROOT / ".github" / "workflows" / "gemini-review.yml",
+    REPO_ROOT / ".github" / "workflows" / "gemini-triage.yml",
+)
+
+
+def _workflow_steps(doc: dict):
+    for job in (doc.get("jobs") or {}).values():
+        if isinstance(job, dict):
+            for step in job.get("steps") or []:
+                if isinstance(step, dict):
+                    yield step
+
+
+class TestGeminiContextPath:
+    def test_context_files_are_outside_gitignore(self):
+        """read_file rejects gitignored paths, so collect and the prompt must
+        name the same context file and git check-ignore must not ignore it.
+        """
+        for path in _CONTEXT_WORKFLOWS:
+            doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+            collect_paths = []
+            run_paths = []
+            prompt_paths = []
+            for step in _workflow_steps(doc):
+                run = step.get("run")
+                if isinstance(run, str):
+                    collect_paths.extend(_COLLECT_PATH_RE.findall(run))
+                    run_paths.extend(_CONTEXT_PATH_RE.findall(run))
+                with_block = step.get("with")
+                prompt = with_block.get("prompt") if isinstance(with_block, dict) else None
+                if isinstance(prompt, str):
+                    prompt_paths.extend(_CONTEXT_PATH_RE.findall(prompt))
+            assert collect_paths, f"{path.name} has no collect path"
+            assert len(set(collect_paths)) == 1, collect_paths
+            context_path = collect_paths[0]
+            assert prompt_paths, f"{path.name} prompt names no context path"
+            assert set(prompt_paths) == {context_path}
+            assert set(run_paths) == {context_path}
+            proc = subprocess.run(
+                ["git", "check-ignore", "-q", context_path],
+                cwd=REPO_ROOT,
+                capture_output=True,
+            )
+            assert proc.returncode == 1, (
+                f"{path.name} context path {context_path!r} is gitignored "
+                f"(git check-ignore -q exit {proc.returncode})"
+            )
