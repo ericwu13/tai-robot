@@ -599,14 +599,20 @@ def fetch_bea_events(cfg: CalendarConfig, http_get: HttpGet = default_http_get) 
 class NasdaqPartialFailure(Exception):
     """Some Nasdaq tickers failed and some returned events.
 
-    ``events`` are the successes. The message lists every ticker failure,
-    including the HTTP status. The orchestrator keeps ``events`` and still
-    marks the source failed so the run is degraded.
+    ``events`` are the successes and ``failed_categories`` names the
+    ``earnings_<sym>`` categories that errored so the orchestrator can
+    retain their prior cached entries while still marking the run degraded.
     """
 
-    def __init__(self, detail: str, events: list[dict[str, Any]]):
+    def __init__(
+        self,
+        detail: str,
+        events: list[dict[str, Any]],
+        failed_categories: frozenset[str] = frozenset(),
+    ):
         super().__init__(detail)
         self.events = events
+        self.failed_categories = failed_categories
 
 
 def fetch_nasdaq_earnings(
@@ -617,6 +623,7 @@ def fetch_nasdaq_earnings(
         return []
     events: list[dict[str, Any]] = []
     failures: list[str] = []
+    failed_categories: set[str] = set()
     for rule in cfg.tickers:
         url = NASDAQ_EARNINGS_URL.format(symbol=rule.symbol)
         try:
@@ -631,13 +638,14 @@ def fetch_nasdaq_earnings(
         except Exception as exc:  # noqa: BLE001 — one ticker failure shouldn't drop all others
             detail = f"{rule.symbol}: {type(exc).__name__}: {exc}"
             failures.append(detail)
+            failed_categories.add(f"earnings_{rule.symbol.lower()}")
             logger.warning("Nasdaq earnings fetch failed: %s", detail)
     if not failures:
         return events
     summary = "; ".join(failures)
     if len(failures) == len(cfg.tickers):
         raise RuntimeError(f"all {len(failures)} Nasdaq earnings queries failed ({summary})")
-    raise NasdaqPartialFailure(summary, events)
+    raise NasdaqPartialFailure(summary, events, failed_categories=frozenset(failed_categories))
 
 
 # ── Orchestrator: merge, deduplicate, cache fallback, window filter ──────
@@ -765,6 +773,13 @@ def build_calendar_events(
             sources_failed.append(name)
             errors[name] = f"{type(exc).__name__}: {exc}"[:200]
             fetched = list(exc.events)
+            cached = prev_cache.get(name)
+            if isinstance(cached, list) and exc.failed_categories:
+                fetched.extend(
+                    e for e in cached
+                    if isinstance(e, dict)
+                    and str(e.get("category") or "").lower() in exc.failed_categories
+                )
             partial = True
             saw_partial = True
         except Exception as exc:  # noqa: BLE001 — isolate source failure
@@ -778,7 +793,8 @@ def build_calendar_events(
         if not partial:
             sources_ok.append(name)
         # Keep a bounded window in cache so calendar_state.json stays small.
-        # A partial Nasdaq failure caches the fresh successes, not the old file.
+        # A partial Nasdaq failure keeps fresh successes plus prior cached
+        # entries for the tickers that errored.
         windowed = [
             e for e in fetched
             if lo <= str(e.get("date") or "") <= hi

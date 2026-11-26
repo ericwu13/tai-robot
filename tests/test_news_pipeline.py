@@ -1304,8 +1304,10 @@ class TestRssScorerV2Integration:
         assert pulse["threshold"] == pytest.approx(0.85)
         assert pulse["w3"]["direction"] == ""  # one bearish story no longer clears 0.85
         assert len(pulse["drivers"]["down"]) == 1
-        # The log still stores the legacy signed materiality, not the breadth weight.
-        assert pulse["drivers"]["down"][0]["contribution"] < -0.90
+        # Drivers now use v2.weighted_score (2 outlets -> -0.6667) decayed by one 10h EMA step.
+        assert pulse["drivers"]["down"][0]["contribution"] == pytest.approx(
+            -0.6667 * ema_decay_for(10.0), abs=0.002
+        )
         runs = news_trend.read_runs(str(log_base))
         assert len(runs) == 2
 

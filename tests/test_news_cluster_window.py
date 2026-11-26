@@ -158,6 +158,49 @@ def test_classified_cluster_is_not_evicted_when_reclassification_fails():
     assert second.l2_tier_upgraded_count == 1 and state["n"] == 2 and second.l3_succeeded == 0
     assert second.passed_count == 0 and len(pipe.clusterer.active) == 1
     assert pipe.clusterer.active[0].classified_category == "GOVERNANCE_REGULATORY"
+    assert pipe.clusterer.active[0].source_tier == 3
+
+    # A later Tier-1 wire story can still upgrade and route the cluster
+    state.update(bad=False, n=0)
+    third = pipe.run(
+        [_art(_SEC, "t1_b", "https://bloomberg.com/sec-3", source="Bloomberg Markets")],
+        now=_NOW + timedelta(minutes=30),
+    )
+    assert third.l2_tier_upgraded_count == 1
+    assert third.l3_attempted == 1 and third.l3_succeeded == 1 and third.passed_count == 1
+    assert pipe.clusterer.active[0].source_tier == 1
+    assert pipe.clusterer.active[0].routed is True
+
+
+def test_tier3_upgrade_api_error_reverts_tier_so_retry_routes():
+    from src.news.pipeline import ClassifierAPIError
+
+    state = {"fail": False}
+
+    def transport(_p):
+        if state["fail"]:
+            raise ClassifierAPIError(503, "unavailable")
+        return ntp._valid_event_json()
+
+    pipe = _pipe(transport)
+    first = pipe.run(
+        [_art("美國SEC傳啟動輝達會計審查", "t3", "https://etoday.com/1", source="ETtoday財經雲")],
+        now=_NOW,
+    )
+    assert first.l3_succeeded == 1 and first.passed_count == 0
+
+    state["fail"] = True
+    reuters = _art(_SEC, "t1", "https://reuters.com/sec-2", source="Reuters")
+    second = pipe.run([reuters], now=_NOW + timedelta(minutes=15))
+    assert second.api_error is not None and second.passed_count == 0
+    assert "t1" not in second.safe_seen_guids
+    assert pipe.clusterer.active[0].source_tier == 3
+
+    # Retrying the same Reuters article after 503 recovery upgrades and routes
+    state["fail"] = False
+    third = pipe.run([reuters], now=_NOW + timedelta(minutes=30))
+    assert third.l2_tier_upgraded_count == 1 and third.l3_succeeded == 1 and third.passed_count == 1
+    assert pipe.clusterer.active[0].source_tier == 1 and pipe.clusterer.active[0].routed is True
 
 
 def _urlopen(monkeypatch, bodies, sink=None):
