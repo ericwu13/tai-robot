@@ -42,8 +42,8 @@ HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
 SEND_QUEUE_MAX = 200
 PRIORITY_BACKLOG_MAX = 200
-# False from _deliver is retried this many times. A read timeout is not
-# (the POST may have landed). Zero drops the send on the first error.
+# A retryable False (429, 5xx, connection/timeout) is put back this many
+# times. Any other 4xx is final. Zero drops the send on the first error.
 WORKER_SEND_RETRIES = 1
 # Best-effort: one 1/2/4s cycle, one worker retry, plus connect.
 # Retry-After can stretch a sleep to RETRY_AFTER_SLEEP_CAP_S and outlast
@@ -149,8 +149,8 @@ class DiscordNotifier:
         routine so a caller that does not opt in cannot fill that deque.
 
         HTTP 429 is retried inside ``_deliver`` (1s, 2s, 4s, or Retry-After
-        capped at 15s), not by enqueueing again. A False return is one
-        worker retry, except a read timeout.
+        capped at 15s), not by enqueueing again. The worker retries one
+        more time for 429, 5xx, and transport errors. Any other 4xx is final.
         """
         if not self.enabled:
             return
@@ -277,7 +277,7 @@ class DiscordNotifier:
                 except Exception:
                     logger.exception(
                         "Discord worker error (bot=%s)", self._bot_name)
-                # Requeue before finally clears _in_flight. Read timeout: no retry.
+                # Requeue before finally clears _in_flight. A final 4xx does not.
                 if (item is not None and not sent_ok
                         and not getattr(self, "_skip_worker_retry", False)):
                     self._retry_failed_item(item, from_backlog)
@@ -387,6 +387,9 @@ class DiscordNotifier:
                             resp.status_code, resp.text[:500], target,
                             self._bot_name,
                         )
+                        # 429 is handled above. Any other 4xx is final.
+                        if resp.status_code < 500:
+                            self._skip_worker_retry = True
                         return False
                     return True
                 time.sleep(_retry_after_sleep_s(resp, delay))
@@ -396,19 +399,11 @@ class DiscordNotifier:
                 "channel=%s, bot=%s", target, self._bot_name,
             )
             return False
-        except Exception as exc:
-            if type(exc).__name__ == "ReadTimeout":
-                self._skip_worker_retry = True
-                logger.warning(
-                    "Discord send not retried: read timeout after the "
-                    "request was sent (channel=%s, bot=%s)",
-                    target, self._bot_name,
-                )
-            else:
-                logger.exception(
-                    "Discord send error (channel=%s, bot=%s)",
-                    target, self._bot_name,
-                )
+        except Exception:
+            logger.exception(
+                "Discord send error (channel=%s, bot=%s)",
+                target, self._bot_name,
+            )
             return False
 
     def notify(self, message: str, *, priority: bool = False) -> None:

@@ -7,6 +7,8 @@ operator hot-swap text from ``mode_switched``.
 
 from __future__ import annotations
 
+import pytest
+
 from src.live.discord_notify import DiscordNotifier
 
 
@@ -35,43 +37,39 @@ def _note():
     return DiscordNotifier("token", "999", bot_name="b")
 
 
-def test_false_deliver_is_retried_and_read_timeout_is_not():
-    import httpx
-    import threading
+def _wait_posts(posts, n, timeout=2.0):
     import time
+    deadline = time.monotonic() + timeout
+    while len(posts) < n and time.monotonic() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.15)
 
-    note = _note()
-    calls, retried, done = [], [], threading.Event()
 
-    def _deliver(content, target):
-        calls.append(content)
-        if len(calls) == 1:
-            return False
-        done.set()
-        return True
+@pytest.mark.parametrize("fail,n", [
+    (403, 1), (404, 1), (500, 2), (429, 6), ("read", 2), ("conn", 2),
+])
+def test_worker_retries_429_5xx_and_transport_not_other_4xx(fail, n, monkeypatch):
+    import httpx
+    import src.live.discord_notify as dn
 
-    orig = note._retry_failed_item
-    note._deliver = _deliver
-    note._retry_failed_item = lambda item, backlog: retried.append(item[0]) or orig(item, backlog)
-    note._send("ping", priority=True)
-    assert done.wait(3), calls
-    assert calls == ["ping", "ping"] and retried == ["ping"]
-
+    monkeypatch.setattr(dn.time, "sleep", lambda _d: None)
     posts = []
 
     class _Client:
         def post(self, *args, **kwargs):
             posts.append(1)
-            raise httpx.ReadTimeout("read")
+            if fail == "read":
+                raise httpx.ReadTimeout("read")
+            if fail == "conn":
+                raise httpx.ConnectError("conn")
+            return type("R", (), {
+                "status_code": fail, "text": "x", "headers": {}})()
 
-    late = _note()
-    late._http = _Client()
-    late._send("once", priority=True)
-    deadline = time.monotonic() + 1.0
-    while not posts and time.monotonic() < deadline:
-        time.sleep(0.01)
-    time.sleep(0.15)
-    assert posts == [1]
+    note = _note()
+    note._http = _Client()
+    note._send("m", priority=True)
+    _wait_posts(posts, n)
+    assert posts == [1] * n
 
 
 def test_retry_after_header_sets_the_429_sleep_and_caps_it(monkeypatch):

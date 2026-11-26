@@ -1401,9 +1401,7 @@ def test_long_flush_runs_before_spawn_and_post_spawn_flush_is_five_seconds(
         args=SimpleNamespace(symbol="TMF00"))
     assert ha._spawn_pending_restart(driver, 0) == 0
     assert order == [
-        ("flush", FLUSH_EXIT_TIMEOUT_S), "spawn",
-        ("flush", ha._POST_SPAWN_FLUSH_S)]
-    assert ha._POST_SPAWN_FLUSH_S == 5.0
+        ("flush", FLUSH_EXIT_TIMEOUT_S), "spawn", ("flush", 5.0)]
 
 
 def test_discord_warning_reaches_stdout_before_pid_wait(
@@ -1531,7 +1529,7 @@ def test_release_com_is_idempotent_and_shutdown_without_a_host_releases(capsys):
         _restore_com_globals(saved)
 
 
-def test_shutdown_arms_dump_then_unadvises_and_return_cancels(
+def test_shutdown_arms_dump_and_return_from_main_does_not_cancel(
         tmp_path, monkeypatch, capsys):
     import faulthandler
     from run_backtest import note_return_from_main
@@ -1568,7 +1566,7 @@ def test_shutdown_arms_dump_then_unadvises_and_return_cancels(
         assert order == ["leave", "dump", "disc"]
         assert dumps == [(30, False, True)] and "cancel" not in order
         note_return_from_main()
-        assert order[-1] == "cancel"
+        assert "cancel" not in order
         assert "return from main" in capsys.readouterr().out
         order.clear()
         dumps.clear()
@@ -1588,8 +1586,9 @@ def test_shutdown_arms_dump_then_unadvises_and_return_cancels(
         handle.close()
 
 
-def test_atexit_brackets_comtypes_shutdown(monkeypatch, capsys):
+def test_atexit_brackets_comtypes_shutdown(monkeypatch, capsys, tmp_path):
     import atexit
+    import faulthandler
     import logging
     import sys
     import types
@@ -1631,17 +1630,32 @@ def test_atexit_brackets_comtypes_shutdown(monkeypatch, capsys):
         logging.getLogger("comtypes._post_coinit.unknwn").debug(
             "Calling CoUninitialize()")
         assert "Calling CoUninitialize()" in capsys.readouterr().out
+        handle = open(tmp_path / "fh.log", "a", encoding="utf-8")
+        rb._faulthandler_log = handle
+        rb._exit_dump_skip_logged = False
+        dumps = []
+        monkeypatch.setattr(
+            faulthandler, "dump_traceback_later",
+            lambda timeout, exit=False, file=None: dumps.append(
+                (timeout, exit, file is handle)))
         wrappers[-1]()
         out = capsys.readouterr().out
+        assert dumps == [(30, False, True)]
         assert "atexit begin" in out and "atexit end" in out and called == [1]
+        handle.close()
+        rb._exit_dump_skip_logged = False
+        dumps.clear()
         with pytest.raises(RuntimeError, match="co"):
             wrappers[-1]()
-        assert "atexit end" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert dumps == [] and "no open handle" in out and "atexit end" in out
         seen.clear()
         arm_process_exit_diagnostics()
         assert seen == []
     finally:
         _restore_com_globals(saved)
+        if "handle" in locals() and not handle.closed:
+            handle.close()
         atexit.unregister(locals().get("original", lambda: None))
         for fn in kept:
             atexit.unregister(fn)

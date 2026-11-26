@@ -670,12 +670,7 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     A replacement that dies at pid-wait, relogin, login, or the pre-deploy
     position prompt has not run ``_deploy_live_continue``, so ``rb._discord``
     is still None. An already installed notifier is returned as-is.
-    Warnings are attached here so a failure before that deploy is on stdout.
     """
-    try:
-        rb.attach_app_log_handlers()
-    except Exception:
-        pass
     current = getattr(rb, "_discord", None)
     if current is not None:
         return current
@@ -685,8 +680,8 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     try:
         cfg = load() or {}
     except Exception as exc:
-        rb._log(f"[HEADLESS] discord settings unreadable: "
-                f"[{type(exc).__name__}] {exc}")
+        rb._safe_log(f"[HEADLESS] discord settings unreadable: "
+                     f"[{type(exc).__name__}] {exc}")
         return None
     if not isinstance(cfg, dict):
         return None
@@ -708,11 +703,6 @@ def _log_discord_flush(discord, timeout_s: float) -> bool:
     flush = getattr(discord, "flush", None)
     if not callable(flush):
         return True
-    try:
-        import faulthandler
-        faulthandler.cancel_dump_traceback_later()
-    except Exception:
-        pass
     ok = False
     try:
         ok = bool(flush(timeout_s=timeout_s))
@@ -722,10 +712,6 @@ def _log_discord_flush(discord, timeout_s: float) -> bool:
     rb._safe_log(f"[HEADLESS] discord flush {ok}")
     if not ok:
         rb._safe_log("[HEADLESS] discord send may have been cut off")
-    try:
-        rb._arm_exit_traceback_dump()
-    except Exception:
-        pass
     return ok
 
 
@@ -735,8 +721,8 @@ def _flush_discord(discord) -> None:
 
 def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
                          symbol: str = "") -> None:
-    rb._log("[HEADLESS] degraded auto-restart failed: "
-            + reason + (f" — {detail}" if detail else ""))
+    rb._safe_log("[HEADLESS] degraded auto-restart failed: "
+                 + reason + (f" — {detail}" if detail else ""))
     discord = _resolve_discord(bot=bot, symbol=symbol)
     if discord is None or not getattr(discord, "enabled", False):
         return
@@ -752,8 +738,8 @@ def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
         from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
         _log_discord_flush(discord, FLUSH_EXIT_TIMEOUT_S)
     except Exception as exc:
-        rb._log(f"[HEADLESS] restart-failed alert failed: "
-                f"[{type(exc).__name__}] {exc}")
+        rb._safe_log(f"[HEADLESS] restart-failed alert failed: "
+                     f"[{type(exc).__name__}] {exc}")
 
 
 def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
@@ -816,10 +802,7 @@ def run_deploy(args) -> int:
     if old_pid > 0:
         # Before _boot, so a pid-wait warning is on stdout. Deploy's
         # own attach runs only after the wait succeeds.
-        try:
-            rb.attach_app_log_handlers()
-        except Exception:
-            pass
+        rb.attach_app_log_handlers()
         rb._safe_log(f"[HEADLESS] pid-wait start old={old_pid}")
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
             _emit_restart_failed(

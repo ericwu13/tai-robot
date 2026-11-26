@@ -3060,7 +3060,8 @@ class BacktestApp:
             try:
                 host.shutdown(_taipei_now())
             except Exception as e:
-                _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
+                _safe_log(
+                    f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
             self._link_host = None
         # LeaveMonitor (or the skip) has returned. Arm while the
         # apartment is still alive, then Unadvise, then drop the refs.
@@ -13894,6 +13895,7 @@ def _arm_comtypes_atexit() -> None:
         atexit.unregister(original)
         def _wrapped() -> None:
             _safe_log("atexit begin")
+            _arm_exit_traceback_dump()
             try:
                 original()
             finally:
@@ -13930,12 +13932,8 @@ def release_com_connections() -> None:
 
 
 def note_return_from_main() -> None:
-    """Cancel the hang dump once main is actually returning."""
+    """Log that main is returning. The hang dump stays armed."""
     _safe_log("[HEADLESS] return from main")
-    try:
-        faulthandler.cancel_dump_traceback_later()
-    except Exception:
-        pass
 
 
 def main():
