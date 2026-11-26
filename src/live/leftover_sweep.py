@@ -1,7 +1,10 @@
-"""`.exiting` markers. The watchdog is the only deleter.
+"""`.exiting` markers. The watchdog deletes them, and ``acquire_lock``
+removes one whose pid is this process.
 
-One bot scans the deploy root every 300s. ``HangWatchdog._poll`` has no
-host stamp, so the stamp file stays. Creation time is Windows-only.
+``_shutdown_link`` writes the marker for the last bot this process
+deployed. ``release_lock`` does not. One bot scans the deploy root
+every 300s. ``HangWatchdog._poll`` has no host stamp, so the stamp
+file stays. Creation time is Windows-only.
 """
 
 from __future__ import annotations

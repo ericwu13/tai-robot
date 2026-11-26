@@ -1,12 +1,11 @@
-"""`.exiting` is written when the lock is released and cleared only by the watchdog."""
+"""`.exiting` is written at process shutdown for the last deployed bot."""
 
 from __future__ import annotations
 
 import inspect
 import json
 import os
-
-import pytest
+import time
 
 from src.live.leftover_sweep import (
     EXITING_ALERT_AFTER_S,
@@ -110,46 +109,128 @@ def test_corrupt_marker_is_deleted_with_one_log(tmp_path, caplog):
     assert sum("unreadable" in rec.message for rec in caplog.records) == 1
 
 
-def test_release_lock_writes_exiting_on_the_lock_release_path(tmp_path, monkeypatch):
+def test_release_lock_does_not_write_exiting(tmp_path):
     runner = LiveRunner(
         NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="TestBot")
     runner.acquire_lock()
     marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
-    present = {}
-    real_remove = os.remove
-
-    def spy_remove(path):
-        if path == runner._lock_path:
-            present["before_unlock"] = os.path.isfile(marker)
-        real_remove(path)
-
-    monkeypatch.setattr(os, "remove", spy_remove)
     runner.release_lock()
-    assert present["before_unlock"] is True
     assert not os.path.isfile(runner._lock_path)
-    assert os.path.isfile(marker)
-    data = json.loads(open(marker, encoding="utf-8").read())
-    assert data["pid"] == os.getpid()
-    if os.name == "nt":
-        assert data["created_at"]
-    else:
-        assert data["created_at"] is None
-    assert data["written_at"]
+    assert not os.path.isfile(marker)
     assert "release_lock" in inspect.getsource(LiveRunner.stop)
+    assert "write_exiting_marker" not in inspect.getsource(LiveRunner.release_lock)
+    assert inspect.getsource(LiveRunner.release_lock).count("os.remove") == 1
+    write_exiting_marker(runner.bot_dir, pid=os.getpid(), created_at=1.0,
+                         written_at=1.0)
+    runner.acquire_lock()
+    assert not os.path.isfile(marker)
+    write_exiting_marker(runner.bot_dir, pid=os.getpid() + 1, created_at=1.0,
+                         written_at=1.0)
+    runner.acquire_lock()
+    assert os.path.isfile(marker)
 
 
 def test_exiting_process_never_deletes_the_marker(tmp_path):
     runner = LiveRunner(
         NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="TestBot")
-    runner.acquire_lock()
-    runner.release_lock()
     marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
+    write_exiting_marker(runner.bot_dir, pid=os.getpid(), created_at=1.0,
+                         written_at=1.0)
+    runner.release_lock()
     runner.release_lock()
     from run_backtest import note_return_from_main
     note_return_from_main()
     assert os.path.isfile(marker)
     assert "os.remove" not in inspect.getsource(write_exiting_marker)
     assert inspect.getsource(LiveRunner.release_lock).count("os.remove") == 1
+
+
+def _quiet_shutdown(monkeypatch):
+    import run_backtest as rb
+    monkeypatch.setattr(rb, "arm_process_exit_diagnostics", lambda: None)
+    monkeypatch.setattr(rb, "release_com_connections", lambda: None)
+
+
+def _shutdown_app():
+    import run_backtest as rb
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._exit_marker_bot_dir = None
+    app._link_host = None
+    return app
+
+
+def test_gui_stop_does_not_alert_while_the_process_stays_up(tmp_path, monkeypatch):
+    from tests.test_deploy_abort_keeps_position import _app, _runner
+    monkeypatch.setattr(
+        "src.live.leftover_sweep.process_created_at", lambda _pid: 100.0)
+    runner = _runner(tmp_path, "paper")
+    runner.acquire_lock()
+    app, _discord = _app(monkeypatch, runner, "paper", confirmed=False)
+    app._exit_marker_bot_dir = runner.bot_dir
+    app._stop_live()
+    assert app._live_runner is None
+    alerts = []
+    check_exiting_markers(
+        runner.bot_dir, alert_fn=alerts.append,
+        now=lambda: time.time() + 120,
+        alive=lambda _pid: True, creation_of=lambda _pid: 100.0)
+    assert alerts == []
+    assert not os.path.isfile(os.path.join(runner.bot_dir, EXITING_FILENAME))
+
+
+def test_redeploy_marks_the_second_bot_on_exit(tmp_path, monkeypatch):
+    import run_backtest as rb
+    monkeypatch.setattr(
+        "src.live.leftover_sweep.process_created_at", lambda _pid: 100.0)
+    _quiet_shutdown(monkeypatch)
+    first = LiveRunner(
+        NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="First")
+    second = LiveRunner(
+        NeverTradeStrategy(), "TX00", log_dir=str(tmp_path), bot_name="Second")
+    app = _shutdown_app()
+    deploy = inspect.getsource(rb.BacktestApp._deploy_live_continue)
+    arm = deploy.index("enable_reconnect_faulthandler")
+    assert "_exit_marker_bot_dir = self._live_runner.bot_dir" in deploy[arm - 500:arm]
+    init = inspect.getsource(rb.BacktestApp.__init__)
+    assert "_exit_marker_bot_dir = None" in init
+    assert "_exit_marker_bot_dir" not in inspect.getsource(rb.BacktestApp._stop_live)
+    first.acquire_lock()
+    app._exit_marker_bot_dir = first.bot_dir
+    first.release_lock()
+    second.acquire_lock()
+    app._exit_marker_bot_dir = second.bot_dir
+    alerts = []
+    check_exiting_markers(
+        first.bot_dir, alert_fn=alerts.append,
+        now=lambda: time.time() + 120,
+        alive=lambda _pid: True, creation_of=lambda _pid: 100.0)
+    assert alerts == []
+    app._live_runner = None
+    app._shutdown_link()
+    assert os.path.isfile(os.path.join(second.bot_dir, EXITING_FILENAME))
+    assert not os.path.isfile(os.path.join(first.bot_dir, EXITING_FILENAME))
+    saved = json.loads(open(
+        os.path.join(second.bot_dir, EXITING_FILENAME), encoding="utf-8").read())
+    assert saved["pid"] == os.getpid()
+
+
+def test_headless_stop_writes_the_marker_after_the_runner_is_gone(
+        tmp_path, monkeypatch):
+    from tests.test_deploy_abort_keeps_position import _app, _runner
+    _quiet_shutdown(monkeypatch)
+    runner = _runner(tmp_path, "paper")
+    runner.acquire_lock()
+    app, _discord = _app(monkeypatch, runner, "paper", confirmed=False)
+    app._exit_marker_bot_dir = runner.bot_dir
+    app._link_host = None
+    app._stop_live()
+    marker = os.path.join(runner.bot_dir, EXITING_FILENAME)
+    assert app._live_runner is None
+    assert not os.path.isfile(marker)
+    app._shutdown_link()
+    assert os.path.isfile(marker)
+    saved = json.loads(open(marker, encoding="utf-8").read())
+    assert saved["pid"] == os.getpid()
 
 
 def test_default_liveness_removes_a_dead_pid_without_an_alert(tmp_path):
