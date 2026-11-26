@@ -16,6 +16,10 @@ foolproofing. One clear rule beats a branch per scenario.
   (e.g. merging master) reuses the last verdict.
 - Claude posts one summary comment (edited in place) and inline threads for
   P1/P2 only. P3s appear only in the summary.
+- New issues from collaborators/owner (and issues labeled `gemini-triage` or
+  dispatched manually) get a read-only Gemini triage comment (edited in place)
+  plus safe triage labels (`bug`/`enhancement`/`documentation`/`question`/
+  `duplicate` and `P1`/`P2`/`P3` when unset). It never edits code or blocks PRs.
 - The owner (Eric) merges. Agents never merge, tag, release or deploy.
 
 ## If you wrote the PR
