@@ -248,7 +248,14 @@ class TestClaudeWorkflowSecurityInvariants:
         resolve_job = wf["jobs"]["resolve-threads"]
 
         assert "CLAUDE_REVIEW_APP_ID" in review_job["env"]
-        assert "CLAUDE_REVIEW_APP_ID" in resolve_job["env"]
+        assert review_job["outputs"]["app_slug"] == "${{ steps.app-token.outputs.app-slug }}"
+        assert not any(
+            str(s.get("uses", "")).startswith("actions/create-github-app-token@")
+            for s in resolve_job["steps"]
+        )
+        resolve_env = next(s for s in resolve_job["steps"] if s.get("env"))["env"]
+        assert resolve_env["GH_TOKEN"] == "${{ github.token }}"
+        assert resolve_env["APP_SLUG"] == "${{ needs.review.outputs.app_slug }}"
 
         gate_step = next(s for s in review_job["steps"] if s.get("id") == "gate")
         assert "claude-opus-5-5" in gate_step["run"]
