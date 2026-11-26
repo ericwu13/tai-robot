@@ -58,8 +58,15 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft }}
           SAME_REPO: ${{ github.event.pull_request.head.repo.full_name == github.repository }}
           HAS_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'claude-review') }}
+          MODEL_VAR: ${{ vars.CLAUDE_REVIEW_MODEL }}
+          EFFORT_VAR: ${{ vars.CLAUDE_REVIEW_EFFORT }}
         run: |
           eligible=false
+          # Default to Claude Opus 5.5 at high effort (Anthropic's top agentic coding model
+          # across all Claude plans). Override via repo vars CLAUDE_REVIEW_MODEL (e.g.
+          # claude-fable-5-2 on Max/Ultra or API) and CLAUDE_REVIEW_EFFORT (e.g. xhigh).
+          model="${MODEL_VAR:-claude-opus-5-5}"
+          effort="${EFFORT_VAR:-high}"
           if [ "$SAME_REPO" = "true" ]; then
             case "$ACTION" in
               opened|reopened|ready_for_review) [ "$DRAFT" = "false" ] && eligible=true ;;
@@ -68,7 +75,9 @@ jobs:
             esac
           fi
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
-          echo "action=$ACTION draft=$DRAFT same_repo=$SAME_REPO has_label=$HAS_LABEL -> eligible=$eligible"
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+          echo "effort=$effort" >> "$GITHUB_OUTPUT"
+          echo "action=$ACTION draft=$DRAFT same_repo=$SAME_REPO has_label=$HAS_LABEL model=$model effort=$effort -> eligible=$eligible"
 
       # Label auto-reviewed PRs so later pushes re-review. Labels added with
       # the job token do not trigger another workflow run.
@@ -145,8 +154,8 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           allowed_bots: cursor
           claude_args: |
-            --model claude-opus-5-5
-            --effort high
+            --model ${{ steps.gate.outputs.model }}
+            --effort ${{ steps.gate.outputs.effort }}
             --max-turns 60
             --allowedTools "Read,Glob,Grep,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(gh pr view:*),Bash(gh pr diff:*)"
             --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["PASS","BLOCK"]},"p1":{"type":"integer"},"p2":{"type":"integer"},"p3":{"type":"integer"},"summary":{"type":"string"},"inline_comments":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"line":{"type":"integer"},"start_line":{"type":"integer"},"body":{"type":"string"}},"required":["path","line","body"]}},"still_open_threads":{"type":"array","items":{"type":"string"}}},"required":["verdict","p1","p2","p3","summary","inline_comments","still_open_threads"]}'
@@ -271,6 +280,7 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           DIFF_HASH: ${{ steps.reuse.outputs.diff_hash }}
+          CLAUDE_MODEL: ${{ steps.gate.outputs.model }}
           # Owner ping when this review adds `needs-owner` (optional secrets).
           DISCORD_REVIEW_WEBHOOK: ${{ secrets.DISCORD_REVIEW_WEBHOOK }}
           DISCORD_OWNER_MENTION: ${{ secrets.DISCORD_OWNER_MENTION }}

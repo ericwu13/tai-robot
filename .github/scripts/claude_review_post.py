@@ -541,11 +541,12 @@ def post(open_json):
                  "owner answers; reply to each open thread with `Fixed in <sha>`, "
                  "`Won't fix: <reason>` or `Needs owner`.")
         ensure_needs_owner(repo, pr)
+    model_name = (os.environ.get("CLAUDE_MODEL") or "claude-opus-5-5").strip() or "claude-opus-5-5"
     body += ("\n\n<sub>Verdict: **%s** | P1 %s | P2 %s | P3 %s | head `%s` | inline %d/%d | "
-             "old threads closing %d, kept %d | BLOCKs on this PR %d | model claude-opus-5-5</sub>"
+             "old threads closing %d, kept %d | BLOCKs on this PR %d | model %s</sub>"
              % (r.get("verdict"), r.get("p1"), r.get("p2"), r.get("p3"), head[:7],
                 len(comments) - len(failed), len(comments), len(todo),
-                len(shown_ids) - len(todo), state["blocks"]))
+                len(shown_ids) - len(todo), state["blocks"], model_name))
     body += "\n<!-- claude-review-state: " + json.dumps(state) + " -->"
     sys.exit(upsert_summary(repo, pr, body, cid, comment_author=prev_author))
 
