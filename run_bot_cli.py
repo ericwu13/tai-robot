@@ -203,10 +203,6 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     # freeze_support() already ran above, before headless imported Tk.
-    _code = main()
-    try:
-        import run_backtest as _rb
-        _rb.note_return_from_main()
-    except Exception:
-        pass
-    sys.exit(_code)
+    # list/status/stop must not import run_backtest here: the exit log
+    # would be appended to --json stdout.
+    sys.exit(main())

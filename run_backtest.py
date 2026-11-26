@@ -14006,9 +14006,9 @@ if __name__ == "__main__":
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
-        _code = run_bot_cli.main(routed)
-        note_return_from_main()
-        sys.exit(_code)
+        # list/status --json must stay valid JSON. The exit log is
+        # inside run_deploy / run_backtest, after a bot or COM boot.
+        sys.exit(run_bot_cli.main(routed))
     if kind != "gui":
         raise SystemExit(0)
     main()

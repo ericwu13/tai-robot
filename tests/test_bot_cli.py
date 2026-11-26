@@ -9,6 +9,8 @@ which asks its questions through ``_confirm`` / ``_alert`` only.
 import inspect
 import json
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -824,3 +826,23 @@ def test_read_lock_never_deletes_stale_lock(tmp_path):
         f.write("garbage")
     assert hl.read_lock(bot_dir) == (False, 0)
     assert os.path.isfile(lock)
+
+
+def test_list_and_status_json_stdout_stays_valid_json():
+    """The exit log must not be appended after --json (deploy skill Gate 2)."""
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    env = os.environ.copy()
+    env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    commands = (
+        ["list", "--json"],
+        ["status", "--symbol", "TMF00", "--bot", "night1", "--json"],
+    )
+    for entry in ("run_bot_cli.py", "run_backtest.py"):
+        for args in commands:
+            proc = subprocess.run(
+                [sys.executable, entry, *args],
+                cwd=repo, env=env, capture_output=True, text=True, timeout=90,
+            )
+            assert proc.returncode == 0, (entry, args, proc.stderr)
+            json.loads(proc.stdout)
+            assert "return from main" not in proc.stdout
