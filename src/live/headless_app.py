@@ -434,15 +434,19 @@ class DeployDriver(_Driver):
         return policy
 
     def _log_restart_outcome(self, outcome) -> None:
-        """One line per outcome change. A steady not-degraded poll is silent."""
-        key = (type(outcome).__name__, str(getattr(outcome, "reason", "")))
+        """One line per outcome change. A steady not-degraded poll is silent;
+        fresh_tick and clock_started share one key, and the line names the
+        first reason."""
+        reason = str(getattr(outcome, "reason", ""))
+        key = (type(outcome).__name__,
+               {"fresh_tick": "clock_started"}.get(reason, reason))
         if key == ("Noop", "not_degraded"):
             self._restart_logged = None
             return
         if key == getattr(self, "_restart_logged", None):
             return
         self._restart_logged = key
-        rb._log(f"[HEADLESS] degraded-restart policy: {key[0]}/{key[1]} "
+        rb._log(f"[HEADLESS] degraded-restart policy: {key[0]}/{reason} "
                 f"mode={getattr(self.app, '_trading_mode', '')}")
 
     def _maybe_degraded_restart(self) -> None:
