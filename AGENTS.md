@@ -15,13 +15,14 @@ foolproofing. One clear rule beats a branch per scenario.
   conversations resolved". A push that leaves the PR's own diff unchanged
   (e.g. merging master) reuses the last verdict.
 - Claude posts one summary comment (edited in place) and inline threads for
-  P1/P2 only. P3s appear only in the summary.
-- Gemini (`gemini-review.yml` / `gemini-triage.yml`, non-blocking) runs
-  read-only PR reviews on non-draft PRs (or drafts labeled `gemini-review`)
-  with native `APPROVE` on PASS and `COMMENT` otherwise when `GEMINI_APP_ID`
-  is configured, and triages new collaborator/owner issues (or `gemini-triage`
-  label) with one edit-in-place comment plus safe labels. It never edits code
-  or blocks auto-merge.
+  P1/P2 only (P3s appear only in the summary). When `CLAUDE_REVIEW_APP_ID` is
+  configured, it posts as that GitHub App bot and submits native `APPROVE` /
+  `REQUEST_CHANGES` PR reviews. Gemini (`gemini-review.yml` /
+  `gemini-triage.yml`, non-blocking) runs read-only PR reviews on non-draft
+  PRs (or drafts labeled `gemini-review`) with native `APPROVE` on PASS and
+  `COMMENT` otherwise when `GEMINI_APP_ID` is configured, and triages new
+  collaborator/owner issues (or `gemini-triage` label) with one edit-in-place
+  comment plus safe labels. It never edits code or blocks auto-merge.
 - The owner (Eric) merges. Agents never merge, tag, release or deploy.
 
 ## If you wrote the PR
