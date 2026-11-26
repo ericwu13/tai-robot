@@ -195,9 +195,10 @@ except ImportError:
 
 
 # How long the pre-deploy position check waits for the asynchronous
-# OnOpenInterest callback before giving up. The callback has been observed
-# ~4s after GetOpenInterestGW; the old fixed 0.5s sleep raced it.
-OI_SNAPSHOT_TIMEOUT_S = 5.0
+# OnOpenInterest callback before giving up. Replies have been observed
+# ~10s after GetOpenInterestGW; 15s is that plus 50% margin. The old
+# fixed 0.5s sleep raced it.
+OI_SNAPSHOT_TIMEOUT_S = 15.0
 
 # Real/auto entries stay held until the first valid GetFutureRights
 # reply has gone through TradingGuard.update_pnl. If that reply has
@@ -9898,7 +9899,7 @@ class BacktestApp:
                     )
                 elif self._oi_wait_must_block():
                     # The OnOpenInterest reply arrives asynchronously through
-                    # the UI queue — observed ~4s after the query. Headless
+                    # the UI queue — observed ~10s after the query. Headless
                     # drains the queue here (no update_idletasks).
                     self._wait_oi_snapshot_blocking()
                 else:
