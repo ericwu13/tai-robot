@@ -71,6 +71,25 @@ CARRY_RE = re.compile(r"\n?<sub>Carried over to [^<]*</sub>")
 BOT_LOGINS = {"github-actions", "github-actions[bot]"}
 DISCORD_LIMIT = 2000
 
+
+def bot_logins(app_slug=None):
+    """All logins recognized as Claude reviews (legacy Actions bot + App bot)."""
+    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
+    logins = set(BOT_LOGINS)
+    if slug:
+        base = slug[:-5] if slug.endswith("[bot]") else slug
+        logins.update({base, f"{base}[bot]"})
+    return logins
+
+
+def actor_logins(app_slug=None):
+    """Logins owned by the current token (only these comments can be PATCHed)."""
+    slug = (os.environ.get("APP_SLUG", "") if app_slug is None else str(app_slug or "")).strip()
+    if slug:
+        base = slug[:-5] if slug.endswith("[bot]") else slug
+        return {base, f"{base}[bot]"}
+    return set(BOT_LOGINS)
+
 THREADS_QUERY = """
 query($owner:String!, $name:String!, $pr:Int!, $after:String) {
   repository(owner:$owner, name:$name) {
@@ -111,6 +130,7 @@ def graphql(query, variables):
 def open_bot_threads(repo, pr):
     """Unresolved threads whose first comment was written by this workflow."""
     owner, name = repo.split("/", 1)
+    known = bot_logins()
     threads, after = [], None
     while True:
         conn = graphql(THREADS_QUERY, {"owner": owner, "name": name, "pr": int(pr),
@@ -118,7 +138,7 @@ def open_bot_threads(repo, pr):
         for t in conn["nodes"]:
             first = (t["comments"]["nodes"] or [{}])[0]
             login = ((first.get("author") or {}).get("login") or "")
-            if not t["isResolved"] and login in BOT_LOGINS:
+            if not t["isResolved"] and login in known:
                 replies = author_replies((t.get("replies") or {}).get("nodes") or [])
                 threads.append({"id": t["id"], "path": t["path"], "line": t["line"],
                                 "body": first.get("body", ""), "url": first.get("url", ""),
@@ -134,9 +154,10 @@ def author_replies(nodes, keep=3):
     Bot comments ("Fixed in" / "Not raised") can pile up after the author's
     answer, so take the last 10 comments and drop the bot's own; the finding
     itself is a bot comment, so it is dropped too. Pure function."""
+    known = bot_logins()
     mine = [{"author": (n.get("author") or {}).get("login", ""),
              "body": (n.get("body") or "")[:1500]}
-            for n in nodes if ((n.get("author") or {}).get("login") or "") not in BOT_LOGINS]
+            for n in nodes if ((n.get("author") or {}).get("login") or "") not in known]
     return mine[-keep:]
 
 
@@ -174,25 +195,33 @@ def resolve_ids(repo, pr, head_sha, ids):
     return done, failed
 
 
-SUMMARY_JQ = ('.[] | select((.user.login == "github-actions[bot]") and '
-              '(.body | startswith("## Claude review"))) | {id, body}')
+SUMMARY_JQ = '.[] | select(.body | startswith("## Claude review")) | {id, body, login: .user.login}'
 
 
-def latest_summary(repo, pr):
-    """(comment_id, body) of the newest Claude summary, or (None, "")."""
+def latest_summary_with_author(repo, pr):
+    """(comment_id, body, author_login) of the newest Claude summary, or (None, "", "")."""
     proc = subprocess.run(
         ["gh", "api", "--paginate", f"repos/{repo}/issues/{pr}/comments", "--jq", SUMMARY_JQ],
         capture_output=True, text=True, encoding="utf-8")
-    last = (None, "")
+    last = (None, "", "")
     if proc.returncode != 0:
         return last
+    known = bot_logins()
     for line in (proc.stdout or "").splitlines():
         try:
             c = json.loads(line)
         except ValueError:
             continue
-        last = (c.get("id"), c.get("body") or "")
+        login = str(c.get("login") or "")
+        if login in known:
+            last = (c.get("id"), c.get("body") or "", login)
     return last
+
+
+def latest_summary(repo, pr):
+    """(comment_id, body) of the newest Claude summary, or (None, "")."""
+    cid, body, _author = latest_summary_with_author(repo, pr)
+    return cid, body
 
 
 def summary_state(body):
@@ -221,9 +250,13 @@ def patch_comment(repo, comment_id, body):
                            "-F", "body=@summary.md"]).returncode
 
 
-def upsert_summary(repo, pr, body, comment_id=None):
-    """Edit the previous Claude summary comment, or create one."""
-    if comment_id is not None:
+def upsert_summary(repo, pr, body, comment_id=None, comment_author=None):
+    """Edit the previous Claude summary comment (if owned by this actor), or create one."""
+    can_patch = (
+        comment_id is not None
+        and (comment_author is None or comment_author in actor_logins())
+    )
+    if can_patch:
         if patch_comment(repo, comment_id, body) == 0:
             print(f"updated summary comment {comment_id}")
             return 0
@@ -248,7 +281,7 @@ def reuse():
     repo, pr = os.environ["GITHUB_REPOSITORY"], os.environ["PR"]
     head = os.environ.get("HEAD_SHA", "")
     h = diff_hash(os.environ.get("BASE", "master"))
-    cid, body = latest_summary(repo, pr)
+    cid, body, author = latest_summary_with_author(repo, pr)
     prev = summary_state(body)
     hit = bool(h) and prev.get("diff") == h and prev.get("verdict") in ("PASS", "BLOCK")
     out = os.environ.get("GITHUB_OUTPUT")
@@ -264,8 +297,10 @@ def reuse():
     note = (f"<sub>Carried over to `{head[:7]}`: the PR's own diff is unchanged "
             f"(e.g. a merge from master), so it was not re-reviewed.</sub>")
     new_body = CARRY_RE.sub("", body).rstrip() + "\n" + note
-    if cid is not None:
+    if cid is not None and author in actor_logins():
         patch_comment(repo, cid, new_body)
+    if os.environ.get("APP_SLUG", "").strip() and head:
+        submit_review(repo, pr, head, prev["verdict"], [], carried_over=True)
 
 
 MENTION_RE = re.compile(r"<@(&?)!?(\d+)>")
@@ -356,6 +391,48 @@ def to_review_comment(c):
     return out
 
 
+def submit_review(repo, pr, head_sha, verdict, comments, *, carried_over=False):
+    """Submit a PR review as the App bot (APPROVE on PASS, REQUEST_CHANGES on BLOCK).
+
+    Falls back to COMMENT-only inline comments when running under github.token
+    (APP_SLUG unset) or if GitHub rejects APPROVE/REQUEST_CHANGES. Returns
+    the list of inline comments that could not be posted inline.
+    """
+    use_app = bool(os.environ.get("APP_SLUG", "").strip())
+    if not use_app:
+        return post_inline(repo, pr, head_sha, comments)
+
+    event = "APPROVE" if verdict == "PASS" else "REQUEST_CHANGES"
+    path = f"repos/{repo}/pulls/{pr}/reviews"
+    if verdict == "PASS":
+        suffix = " (carried over: diff unchanged)" if carried_over else ""
+        review_body = f"Claude review @ `{head_sha[:7]}`: **PASS**{suffix} — see summary comment."
+    else:
+        review_body = (
+            f"Claude review @ `{head_sha[:7]}`: **BLOCK** — "
+            + ("inline P1/P2 findings attached (see summary comment)."
+               if comments else "unresolved P1/P2 findings remain (see summary comment).")
+        )
+
+    payload = {"commit_id": head_sha, "event": event, "body": review_body}
+    if comments:
+        payload["comments"] = [to_review_comment(c) for c in comments]
+
+    ok, err = gh_api(path, payload)
+    if ok:
+        print(f"submitted {event} review with {len(comments)} inline comment(s)")
+        return []
+
+    print(f"{event} review rejected ({err}); retrying inline comments and decision separately")
+    failed = post_inline(repo, pr, head_sha, comments) if comments else []
+    ok2, err2 = gh_api(path, {"commit_id": head_sha, "event": event, "body": review_body})
+    if ok2:
+        print(f"submitted {event} review without inline batch")
+    else:
+        print(f"::warning::could not submit {event} review: {err2}")
+    return failed
+
+
 def post_inline(repo, pr, head_sha, comments):
     """Return the comments that could not be posted inline."""
     if not comments:
@@ -425,14 +502,14 @@ def post(open_json):
 
     comments = [c for c in (r.get("inline_comments") or [])
                 if c.get("path") and c.get("line") and c.get("body")]
-    failed = post_inline(repo, pr, head, comments)
+    failed = submit_review(repo, pr, head, r.get("verdict"), comments)
 
     body = (r.get("summary") or "").strip() or "## Claude review\n\n(no summary returned)"
     if failed:
         body += "\n\n### Findings that could not be posted inline\n"
         for c in failed:
             body += f"\n**`{c['path']}:{c['line']}`**\n\n{c['body']}\n"
-    cid, prev_body = latest_summary(repo, pr)
+    cid, prev_body, prev_author = latest_summary_with_author(repo, pr)
     state = next_state(summary_state(prev_body), r.get("verdict"),
                        os.environ.get("DIFF_HASH", ""), head)
     if r.get("verdict") == "BLOCK" and state["blocks"] >= BLOCKS_BEFORE_OWNER:
@@ -447,7 +524,7 @@ def post(open_json):
                 len(comments) - len(failed), len(comments), len(todo),
                 len(shown_ids) - len(todo), state["blocks"]))
     body += "\n<!-- claude-review-state: " + json.dumps(state) + " -->"
-    sys.exit(upsert_summary(repo, pr, body, cid))
+    sys.exit(upsert_summary(repo, pr, body, cid, comment_author=prev_author))
 
 
 if __name__ == "__main__":

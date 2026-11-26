@@ -15,7 +15,9 @@ foolproofing. One clear rule beats a branch per scenario.
   conversations resolved". A push that leaves the PR's own diff unchanged
   (e.g. merging master) reuses the last verdict.
 - Claude posts one summary comment (edited in place) and inline threads for
-  P1/P2 only. P3s appear only in the summary.
+  P1/P2 only (P3s appear only in the summary). When `CLAUDE_REVIEW_APP_ID` is
+  configured, it posts as that GitHub App bot and submits native `APPROVE` /
+  `REQUEST_CHANGES` PR reviews.
 - The owner (Eric) merges. Agents never merge, tag, release or deploy.
 
 ## If you wrote the PR

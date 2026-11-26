@@ -47,6 +47,8 @@ jobs:
       id-token: write
     outputs:
       resolve_ids: ${{ steps.post.outputs.resolve_ids }}
+    env:
+      CLAUDE_REVIEW_APP_ID: ${{ secrets.CLAUDE_REVIEW_APP_ID }}
 
     steps:
       - name: Decide whether to review
@@ -82,6 +84,25 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Mint a dedicated GitHub App identity (<app-slug>[bot]) when configured,
+      # so Claude can submit real APPROVE / REQUEST_CHANGES PR reviews and own
+      # its threads. Never passed to the Claude LLM step below. Falls back
+      # cleanly to github.token (COMMENT-only) if secrets are unset.
+      - name: Mint Claude Review App token
+        id: app-token
+        if: steps.gate.outputs.eligible == 'true' && env.CLAUDE_REVIEW_APP_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.CLAUDE_REVIEW_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_REVIEW_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-issues: write
+          permission-metadata: read
+          permission-pull-requests: write
+
       # Same PR diff as the last review (a merge from master, a no-op push):
       # carry that verdict over instead of running Opus again. The script is
       # read from the base branch, never from the PR.
@@ -91,7 +112,8 @@ jobs:
         # A crash here must not stop reviews: reuse stays unset, so Claude runs.
         continue-on-error: true
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           BASE: ${{ github.event.pull_request.base.ref }}
@@ -105,7 +127,8 @@ jobs:
       - name: Collect open Claude threads
         if: steps.gate.outputs.eligible == 'true' && steps.reuse.outputs.reuse != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           PR: ${{ github.event.pull_request.number }}
         run: python3 "$RUNNER_TEMP/claude_review_post.py" collect "$GITHUB_WORKSPACE/.claude-review"
 
@@ -242,7 +265,8 @@ jobs:
         id: post
         if: always() && steps.gate.outputs.eligible == 'true' && steps.reuse.outputs.reuse != 'true' && (steps.claude.outputs.structured_output != '' || steps.claude_retry.outputs.structured_output != '')
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           RESULT: ${{ steps.claude.outputs.structured_output || steps.claude_retry.outputs.structured_output }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -288,11 +312,11 @@ jobs:
             exit 1
           fi
 
-  # Resolving a review thread needs more than pull-requests: write (the
-  # review job's token got "Resource not accessible by integration"). This
-  # separate job holds the wider token, so the job where Claude runs stays
-  # read-only. It never runs PR code: the script is fetched from the base
-  # branch. Not a required check.
+  # Resolving a review thread needs more than pull-requests: write under
+  # github.token (it got "Resource not accessible by integration"). When
+  # CLAUDE_REVIEW_APP_ID is configured, the minted App token resolves threads
+  # with contents: read + pull-requests: write. It never runs PR code: the
+  # script is fetched from the base branch. Not a required check.
   resolve-threads:
     needs: review
     if: ${{ always() && needs.review.outputs.resolve_ids != '' && needs.review.outputs.resolve_ids != '[]' }}
@@ -301,10 +325,27 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    env:
+      CLAUDE_REVIEW_APP_ID: ${{ secrets.CLAUDE_REVIEW_APP_ID }}
     steps:
+      - name: Mint Claude Review App token
+        id: app-token
+        if: env.CLAUDE_REVIEW_APP_ID != ''
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.CLAUDE_REVIEW_APP_ID }}
+          private-key: ${{ secrets.CLAUDE_REVIEW_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-metadata: read
+          permission-pull-requests: write
+
       - name: Resolve Claude threads the review no longer raises
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token || github.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           IDS: ${{ needs.review.outputs.resolve_ids }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
