@@ -701,6 +701,44 @@ def test_not_degraded_is_silent_and_rearms(tmp_path, monkeypatch):
     assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 2
 
 
+def test_fresh_tick_and_clock_started_share_one_log_line(tmp_path, monkeypatch):
+    """Reply-only DEGRADED alternates fresh_tick and clock_started.
+
+    Those two Noops are one steady state: one line, the first reason.
+    waiting still logs. not_degraded stays silent and re-arms.
+    """
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    policy = driver._restart_policy
+    # Clock already open, and each poll's tick is newer than it, so
+    # observe_app alternates fresh_tick then clock_started.
+    policy.degraded_open_since = NOW - 1
+
+    n = 6
+    for _ in range(n):
+        app._last_fresh_tick_at = float(policy._now()) + 1.0
+        driver._poll_once()
+    fresh = "[HEADLESS] degraded-restart policy: Noop/fresh_tick mode=paper"
+    waiting = "[HEADLESS] degraded-restart policy: Noop/waiting mode=paper"
+    started = "[HEADLESS] degraded-restart policy: Noop/clock_started mode=paper"
+    assert _policy_lines(logs) == [fresh]
+
+    app._last_fresh_tick_at = 0.0
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting]
+
+    app._link_host = SimpleNamespace(snapshot=lambda: {"degraded": False})
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting]
+
+    app._link_host = SimpleNamespace(snapshot=lambda: {"degraded": True})
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting, started]
+
+
 def test_restart_decision_adds_no_extra_policy_line(tmp_path, monkeypatch):
     """RestartDecision keeps the existing restart line and adds no policy line.
 
