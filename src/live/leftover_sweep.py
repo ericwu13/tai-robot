@@ -1,12 +1,7 @@
-"""A bot that has released ``.lock`` and is still alive.
+"""`.exiting` markers. The watchdog is the only deleter.
 
-``release_lock`` writes ``bot_dir/.exiting`` and never removes it. The
-hang watchdog is the only deleter. Once per five minutes one bot globs
-every ``.exiting`` under the deploy root.
-
-Dead pid, or a live pid with a different creation time: delete the
-marker, no alert. The same process still alive more than 60s after
-``written_at``: alert once and record that on the marker.
+One bot scans the deploy root every 300s. ``HangWatchdog._poll`` has no
+host stamp, so the stamp file stays. Creation time is Windows-only.
 """
 
 from __future__ import annotations
@@ -15,8 +10,10 @@ import json
 import logging
 import os
 import time
+from contextlib import contextmanager
 
 from src.utils.file_lock import _lock_nb, _open_lock_fd, _unlock_fd
+from src.utils.fileio import read_json
 from .host_stall import deploy_root
 
 logger = logging.getLogger(__name__)
@@ -24,8 +21,8 @@ logger = logging.getLogger(__name__)
 EXITING_FILENAME = ".exiting"
 EXITING_ALERT_AFTER_S = 60.0
 EXITING_SCAN_INTERVAL_S = 300.0
-STAMP_FILENAME = "exiting_scan.json"
-LOCK_FILENAME = ".exiting_scan.lock"
+_STAMP_FILENAME = "exiting_scan.json"
+_LOCK_FILENAME = ".exiting_scan.lock"
 
 
 def write_exiting_marker(bot_dir: str, *, pid: int | None = None,
@@ -35,7 +32,6 @@ def write_exiting_marker(bot_dir: str, *, pid: int | None = None,
     try:
         if not bot_dir:
             return
-        os.makedirs(bot_dir, exist_ok=True)
         this_pid = int(os.getpid() if pid is None else pid)
         payload = {
             "pid": this_pid,
@@ -44,27 +40,19 @@ def write_exiting_marker(bot_dir: str, *, pid: int | None = None,
             "written_at": float(time.time() if written_at is None else written_at),
             "alerted": False,
         }
-        path = os.path.join(bot_dir, EXITING_FILENAME)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-            handle.write("\n")
-        os.replace(tmp, path)
+        if not _write_json(os.path.join(bot_dir, EXITING_FILENAME), payload):
+            logger.warning("exiting marker not written for %s", bot_dir)
     except Exception:
         logger.warning("exiting marker not written for %s", bot_dir)
 
 
 def process_created_at(pid: int) -> float | None:
-    """Unix start time of one pid, or None when it cannot be read."""
+    """Windows start time of one pid, or None."""
     try:
         pid = int(pid)
     except (TypeError, ValueError):
         return None
-    if pid <= 0:
-        return None
-    if os.name == "nt":
-        return _windows_created_at(pid)
-    return _linux_created_at(pid)
+    return _windows_created_at(pid) if pid > 0 and os.name == "nt" else None
 
 
 def check_exiting_markers(bot_dir: str, *, alert_fn=None, now=None,
@@ -82,25 +70,23 @@ def _check(bot_dir, *, alert_fn, now, alive, creation_of) -> None:
     if not root or not os.path.isdir(root):
         return
     clock = float(now())
-    stamp_path = os.path.join(root, STAMP_FILENAME)
-    if _stamp_fresh(_load_stamp(stamp_path), clock):
+    stamp_path = os.path.join(root, _STAMP_FILENAME)
+    if _stamp_fresh(read_json(stamp_path), clock):
         return
-    fd = _try_lock(os.path.join(root, LOCK_FILENAME))
-    if fd is None:
-        return
-    try:
-        clock = float(now())
-        if _stamp_fresh(_load_stamp(stamp_path), clock):
+    with _held_lock(os.path.join(root, _LOCK_FILENAME)) as fd:
+        if fd is None:
             return
-        _save_stamp(stamp_path, clock)
+        clock = float(now())
+        if _stamp_fresh(read_json(stamp_path), clock):
+            return
+        if not _write_json(stamp_path, {"last_scan": clock}):
+            logger.warning("exiting scan stamp not written")
         if alive is None:
-            alive = _process_alive
-        if creation_of is None:
-            creation_of = process_created_at
+            from .live_runner import LiveRunner
+            alive = LiveRunner._pid_alive
+        creation_of = process_created_at if creation_of is None else creation_of
         for path in _marker_paths(root):
             _review_one(path, clock, alive, creation_of, alert_fn)
-    finally:
-        _release(fd)
 
 
 def _review_one(path, now, alive, creation_of, alert_fn) -> None:
@@ -109,30 +95,25 @@ def _review_one(path, now, alive, creation_of, alert_fn) -> None:
         logger.warning("exiting marker unreadable, removing it: %s", path)
         _delete_marker(path)
         return
-    pid = data["pid"]
     try:
-        still_alive = bool(alive(pid))
+        if not alive(data["pid"]):
+            _delete_marker(path)
+            return
+        live_created = creation_of(data["pid"])
     except Exception:
         return
-    if not still_alive:
-        _delete_marker(path)
-        return
-    live_created = None
-    try:
-        live_created = creation_of(pid)
-    except Exception:
-        live_created = None
-    if not _same_creation(data.get("created_at"), live_created):
-        if data.get("created_at") is not None and live_created is not None:
+    saved = data.get("created_at")
+    if not _same_creation(saved, live_created):
+        if saved is not None and live_created is not None:
             _delete_marker(path)
         return
     age = now - float(data["written_at"])
     if age <= EXITING_ALERT_AFTER_S or data.get("alerted") is True:
         return
     data["alerted"] = True
-    if not _store_marker(path, data):
+    if not _write_json(path, data):
         return
-    message = (f"exiting process still alive pid={pid} "
+    message = (f"exiting process still alive pid={data['pid']} "
                f"bot_dir={os.path.dirname(path)} age={age:.0f}s")
     logger.warning("%s", message)
     if alert_fn is None:
@@ -144,22 +125,24 @@ def _review_one(path, now, alive, creation_of, alert_fn) -> None:
 
 
 def _load_marker(path):
+    data = read_json(path)
+    if not isinstance(data, dict):
+        return None
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-        pid = int(data["pid"])
-        written = float(data["written_at"])
-    except (OSError, ValueError, TypeError, KeyError):
+        pid, written = int(data["pid"]), float(data["written_at"])
+    except (TypeError, ValueError, KeyError):
         return None
-    if not isinstance(data, dict) or pid <= 0:
+    if pid <= 0:
         return None
-    data["pid"] = pid
-    data["written_at"] = written
+    data["pid"], data["written_at"] = pid, written
     return data
 
 
-def _store_marker(path, data) -> bool:
+def _write_json(path, data) -> bool:
     try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as handle:
             json.dump(data, handle)
@@ -178,112 +161,51 @@ def _delete_marker(path) -> None:
 
 
 def _same_creation(left, right) -> bool:
-    if left is None or right is None:
-        return False
     try:
-        return abs(float(left) - float(right)) < 1.0
+        return (left is not None and right is not None
+                and abs(float(left) - float(right)) < 1.0)
     except (TypeError, ValueError):
         return False
 
 
 def _marker_paths(root: str) -> list[str]:
-    found = []
     try:
         names = os.listdir(root)
     except OSError:
-        return found
-    for name in names:
-        path = os.path.join(root, name, EXITING_FILENAME)
-        if os.path.isfile(path):
-            found.append(path)
-    return found
+        return []
+    return [os.path.join(root, name, EXITING_FILENAME) for name in names
+            if os.path.isfile(os.path.join(root, name, EXITING_FILENAME))]
 
 
-def _stamp_fresh(last, now) -> bool:
-    return last is not None and now - last < EXITING_SCAN_INTERVAL_S
-
-
-def _load_stamp(path):
+def _stamp_fresh(data, now) -> bool:
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-        return float(data["last_scan"])
-    except (OSError, ValueError, TypeError, KeyError):
-        return None
+        return now - float(data["last_scan"]) < EXITING_SCAN_INTERVAL_S
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
 
 
-def _save_stamp(path, when) -> None:
-    try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump({"last_scan": when}, handle)
-        os.replace(tmp, path)
-    except OSError:
-        logger.warning("exiting scan stamp not written")
-
-
-def _try_lock(path):
-    fd = None
+@contextmanager
+def _held_lock(path):
+    """Non-blocking ``file_lock``. Yields None when this process did not get it."""
+    fd, held = None, False
     try:
         fd = _open_lock_fd(path)
-        if _lock_nb(fd):
-            return fd
+        held = _lock_nb(fd)
     except OSError:
-        pass
-    if fd is not None:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-    return None
-
-
-def _release(fd) -> None:
+        held = False
     try:
-        _unlock_fd(fd)
-    except OSError:
-        pass
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-
-
-def _process_alive(pid: int) -> bool:
-    """Whether ``pid`` exists. No signal and no terminate.
-
-    Linux reads ``/proc``. Windows reuses ``LiveRunner._pid_alive``
-    (open one process, read its exit code).
-    """
-    try:
-        pid = int(pid)
-    except (TypeError, ValueError):
-        return False
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        from .live_runner import LiveRunner
-        return bool(LiveRunner._pid_alive(pid))
-    return os.path.isdir(f"/proc/{pid}")
-
-
-def _linux_created_at(pid: int) -> float | None:
-    try:
-        with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
-            rest = handle.read().rsplit(")", 1)[1].split()
-        ticks = int(rest[19])
-        btime = None
-        with open("/proc/stat", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("btime "):
-                    btime = int(line.split()[1])
-                    break
-        if btime is None:
-            return None
-        return btime + ticks / os.sysconf("SC_CLK_TCK")
-    except (OSError, ValueError, IndexError):
-        return None
+        yield fd if held else None
+    finally:
+        if held:
+            try:
+                _unlock_fd(fd)
+            except OSError:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _windows_created_at(pid: int) -> float | None:
@@ -297,21 +219,16 @@ def _windows_created_at(pid: int) -> float | None:
         if not handle:
             return None
         try:
-            created = wintypes.FILETIME()
-            exit_time = wintypes.FILETIME()
-            kernel_time = wintypes.FILETIME()
-            user_time = wintypes.FILETIME()
+            times = [wintypes.FILETIME() for _ in range(4)]
             kernel.GetProcessTimes.argtypes = [ctypes.c_void_p] + [
                 ctypes.POINTER(wintypes.FILETIME)] * 4
             kernel.GetProcessTimes.restype = wintypes.BOOL
             if not kernel.GetProcessTimes(
-                    handle, ctypes.byref(created), ctypes.byref(exit_time),
-                    ctypes.byref(kernel_time), ctypes.byref(user_time)):
+                    handle, *(ctypes.byref(item) for item in times)):
                 return None
-            ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
-            if ticks <= 0:
-                return None
-            return ticks / 10_000_000.0 - 11644473600.0
+            ticks = ((int(times[0].dwHighDateTime) << 32)
+                     | int(times[0].dwLowDateTime))
+            return None if ticks <= 0 else ticks / 10_000_000.0 - 11644473600.0
         finally:
             kernel.CloseHandle(handle)
     except Exception:

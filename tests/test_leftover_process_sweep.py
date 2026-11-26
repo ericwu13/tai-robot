@@ -130,7 +130,10 @@ def test_release_lock_writes_exiting_on_the_lock_release_path(tmp_path, monkeypa
     assert os.path.isfile(marker)
     data = json.loads(open(marker, encoding="utf-8").read())
     assert data["pid"] == os.getpid()
-    assert data["created_at"]
+    if os.name == "nt":
+        assert data["created_at"]
+    else:
+        assert data["created_at"] is None
     assert data["written_at"]
     assert "release_lock" in inspect.getsource(LiveRunner.stop)
 
