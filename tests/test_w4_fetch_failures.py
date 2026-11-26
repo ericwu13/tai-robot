@@ -937,3 +937,110 @@ def test_stale_fetch_failure_reports_stale_not_the_live_fetch(tmp_path):
     assert any(m.startswith("W3 bridge stale") for m in p2), p2
     assert not any(m.startswith("W4 fetch failed") for m in p2), p2
     assert not any(m.startswith("W3 every feed failed") for m in p2), p2
+
+
+# ── non-JSON body evidence; stale last_fetch_error is cleared ───────────
+
+def test_non_json_html_body_reports_status_ctype_len_prefix_and_tag(tmp_path, monkeypatch):
+    """A 200 HTML body names status, type, length, prefix and the block-page tag."""
+    base = str(tmp_path / "regime_vote.json")
+    vote = _seed_vote(base)
+    before = vote.read_bytes()
+    body = b"<!DOCTYPE html><html><body>blocked</body></html>"
+
+    class _Html(_Body):
+        def __init__(self):
+            super().__init__(body)
+            self.headers = {
+                "Content-Type": "text/html; charset=UTF-8",
+                "Set-Cookie": "__cf_bm=SECRETCOOKIE",
+            }
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Html())
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    assert vote.read_bytes() == before
+    state = chips.load_state(chips.state_path_for(base))
+    log = _log(base)
+    err = state.get("last_fetch_error") or ""
+    for text in (log, err):
+        assert "status=200" in text
+        assert "ctype=text/html" in text
+        assert f"len={len(body)}" in text
+        assert "html (likely block page)" in text
+        assert 'prefix="<!DOCTYPE html' in text
+        assert "SECRETCOOKIE" not in text
+        assert "Set-Cookie" not in text
+        assert "openapi.taifex" not in text
+    assert "no taifex data" not in log.lower()
+
+
+def test_non_json_prefix_is_64_bytes_escaped_and_ip_masked(monkeypatch):
+    """The logged prefix is 64 escaped bytes, and an echoed IPv4 is masked."""
+    head = bytes((0x00, 0xFF, 0x22, 0x5C, 0x0A)) + b"203.0.113.7"
+    assert len(head) < 64
+    body = head + (b"A" * (64 - len(head))) + bytes((0x11,))
+    body += b"B" * (200 - len(body))
+    assert len(body) == 200 and body[64] == 0x11
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(body))
+    with pytest.raises(chips.ChipsFetchError) as caught:
+        chips._http_json(chips.TAIFEX_URL)
+    msg = caught.value.message
+    assert "len=200" in msg
+    assert r"\x00" in msg
+    assert r"\xff" in msg
+    assert r"\x22" in msg
+    assert r"\x5c" in msg
+    assert r"\x0a" in msg
+    assert r"\x00\xff\x22\x5c\x0ax.x.x.x" in msg
+    assert "203.0.113.7" not in msg
+    assert r"\x11" not in msg
+    assert all(0x20 <= ord(ch) < 0x7f for ch in msg)
+
+
+def test_non_json_plain_text_has_no_html_tag(monkeypatch):
+    body = b"Access denied"
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(body))
+    with pytest.raises(chips.ChipsFetchError) as caught:
+        chips._http_json(chips.TAIFEX_URL)
+    msg = caught.value.message
+    assert "status=200" in msg
+    assert "len=13" in msg
+    assert "html (likely block page)" not in msg
+
+
+def test_non_json_without_headers_attr_keeps_kind_http(monkeypatch):
+    """_Body has no headers. That must stay kind http, not the generic error kind."""
+    monkeypatch.setattr(
+        chips.urllib.request, "urlopen",
+        lambda *_a, **_k: _Body(b"<html>nope</html>"))
+    with pytest.raises(chips.ChipsFetchError) as caught:
+        chips._http_json(chips.TAIFEX_URL)
+    exc = caught.value
+    assert exc.kind == "http"
+    assert "ctype=?" in exc.message
+
+
+def test_fetch_failure_then_success_clears_last_fetch_error(tmp_path, monkeypatch):
+    base = str(tmp_path / "regime_vote.json")
+    _seed_vote(base)
+    monkeypatch.setattr(
+        chips.urllib.request, "urlopen",
+        lambda *_a, **_k: _Body(b"<html>blocked</html>"))
+    assert chips.run_once(base, "20260814", _FRIDAY) != 0
+    state = chips.load_state(chips.state_path_for(base))
+    assert state.get("fetch_error_streak") == 1
+    assert state.get("last_fetch_error")
+
+    monkeypatch.setattr(chips.urllib.request, "urlopen", lambda *_a, **_k: _Body(b"[]"))
+    assert chips.run_once(base, "20260814", _FRIDAY) == 0
+    state = chips.load_state(chips.state_path_for(base))
+    assert state.get("fetch_error_streak") == 0
+    assert "last_fetch_error" not in state
+
+
+def test_clear_fetch_streak_pops_last_fetch_error():
+    state = {"fetch_error_streak": 3, "last_fetch_error": "x"}
+    chips._clear_fetch_streak(state)
+    assert state["fetch_error_streak"] == 0
+    assert "last_fetch_error" not in state
+    chips._clear_fetch_streak({})
