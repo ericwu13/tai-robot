@@ -83,6 +83,35 @@ def test_drivers_ignore_other_sessions_and_neutral(tmp_path):
     assert d["up"] == [] and d["down"] == [] and d["total"] == 0
 
 
+def test_drivers_v2_live_uses_weighted_score_and_v1_ignores_shadow_v2(tmp_path):
+    """v2 live drivers reflect tier_weight * breadth_multiplier (weighted_score),
+    not raw materiality/5.0; v1 mode still clips r['score'] even if shadow v2 is present."""
+    row = _row("TSMC raises 2026 CapEx", 1.0, RUN1, run_net=0.425, session_net=0.425)
+    row["v2"] = {"weighted_score": 0.425, "materiality": 5, "source_tier": 2, "passed": True}
+    items, log = _items(tmp_path, [row])
+    assert items[0]["weighted_score"] == pytest.approx(0.425)
+
+    # v2 live (clip_scores=False) uses weighted_score (0.425, not 1.0)
+    v2_drivers = news_pulse.build_drivers(items, SESSION, 0.966, clip_scores=False)
+    assert v2_drivers["up"][0]["contribution"] == pytest.approx(0.425)
+    assert v2_drivers["total"] == pytest.approx(0.425)
+
+    # v1 live (clip_scores=True) keeps ±0.5 clip even when a shadow v2 block is attached
+    v1_drivers = news_pulse.build_drivers(items, SESSION, rss_scorer.EMA_DECAY, clip_scores=True)
+    assert v1_drivers["up"][0]["contribution"] == pytest.approx(0.5)
+
+    # End-to-end through news_pulse.pulse() when pipeline_v2_mode == "live"
+    bridge = _bridge(tmp_path)
+    (bridge / "rss_scorer_state.json").write_text(json.dumps({
+        "session_key": SESSION, "session_net": 0.425, "session_peak": 0.425,
+        "recent_runs": [0.425], "last_check": NOW.isoformat(timespec="seconds"),
+        "error_streak": 0, "pipeline_v2_mode": "live",
+    }), encoding="utf-8")
+    out = news_pulse.pulse(NOW, log, _paths(bridge, log), _reader)
+    assert out["drivers"]["total"] == pytest.approx(0.425)
+    assert out["drivers"]["up"][0]["contribution"] == pytest.approx(0.425)
+
+
 def test_w3_state_failing_eroding_and_threshold():
     st = news_pulse.w3_state({
         "session_key": SESSION, "session_net": 1.1, "session_peak": 2.9,

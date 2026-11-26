@@ -9,6 +9,8 @@ which asks its questions through ``_confirm`` / ``_alert`` only.
 import inspect
 import json
 import os
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -824,3 +826,41 @@ def test_read_lock_never_deletes_stale_lock(tmp_path):
         f.write("garbage")
     assert hl.read_lock(bot_dir) == (False, 0)
     assert os.path.isfile(lock)
+
+
+def test_list_and_status_json_stdout_stays_valid_json(tmp_path):
+    """Exit log must not follow --json. Bots dir is empty, like a fresh install."""
+    repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    live = tmp_path / "data" / "live"
+    live.mkdir(parents=True)
+    env = os.environ.copy()
+    env["PYTHONPATH"] = repo + os.pathsep + env.get("PYTHONPATH", "")
+    # project_root() is the repo, so point list/status at a symbol that
+    # has no directory. An empty data/live is the same result.
+    commands = (
+        ["list", "--json", "--symbol", "NOBOT"],
+        ["status", "--symbol", "NOBOT", "--bot", "none", "--json"],
+    )
+    for entry in ("run_bot_cli.py", "run_backtest.py"):
+        for args in commands:
+            proc = subprocess.run(
+                [sys.executable, os.path.join(repo, entry), *args],
+                cwd=str(tmp_path), env=env, capture_output=True, text=True,
+                timeout=90,
+            )
+            assert proc.returncode == 0, (entry, args, proc.stderr, proc.stdout)
+            json.loads(proc.stdout)
+            assert "return from main" not in proc.stdout
+
+
+def test_return_from_main_is_logged_only_after_boot(capsys):
+    saved = rb._process_booted
+    try:
+        rb._process_booted = False
+        rb.note_return_from_main()
+        assert "return from main" not in capsys.readouterr().out
+        rb._mark_process_booted()
+        rb.note_return_from_main()
+        assert "return from main" in capsys.readouterr().out
+    finally:
+        rb._process_booted = saved

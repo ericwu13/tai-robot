@@ -1339,15 +1339,23 @@ def test_missing_discord_still_delivers_before_run_deploy_returns(
 
 
 def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, capsys):
     import src.live.headless_app as ha
     from src.live.discord_notify import DiscordNotifier
 
     _patch_project(monkeypatch, tmp_path)
     sent = []
+    timeouts = []
+    orig_flush = DiscordNotifier.flush
+
+    def _flush(self, timeout_s=5.0):
+        timeouts.append(timeout_s)
+        return orig_flush(self, timeout_s)
+
     monkeypatch.setattr(rb, "_discord", None)
     monkeypatch.setattr(rb, "_load_settings", _settings_with_discord)
     monkeypatch.setattr(DiscordNotifier, "_deliver", _slow_deliver(sent))
+    monkeypatch.setattr(DiscordNotifier, "flush", _flush)
     monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
     monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
@@ -1360,6 +1368,9 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert sent and sent[-1][0] <= finished
     assert "old process still alive" in sent[-1][1]
     assert _pending(bot_dir)["pending_notify"] is False
+    assert "discord flush True" in capsys.readouterr().out
+    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S]
 
     sent.clear()
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
@@ -1375,6 +1386,8 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert "relogin stagger timed out" in sent[-1][1]
     assert _pending(bot_dir)["pending_notify"] is False
     assert _pending(bot_dir)["session_key"] == SESSION
+    assert "discord flush True" in capsys.readouterr().out
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S]
 
 
 def test_empty_discord_settings_log_and_still_clear_pending(tmp_path, monkeypatch, capsys):
@@ -1456,4 +1469,367 @@ def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path
     )
     assert proc.returncode == 0, proc.stderr
     assert marker.is_file(), proc.stderr
+    assert "discord flush True" in proc.stdout, proc.stdout
+    assert "may have been cut off" not in proc.stdout
 
+
+def _com_globals():
+    return (
+        list(rb._com_event_handlers),
+        (rb.skC, rb.skQ, rb.skR, rb.skO),
+        rb._com_released, rb._exit_dump_skip_logged,
+        rb._comtypes_atexit_wrapped, rb._faulthandler_log,
+    )
+
+
+def _restore_com_globals(saved) -> None:
+    handlers, sk, released, skip, wrapped, handle = saved
+    rb._com_event_handlers[:] = handlers
+    rb.skC, rb.skQ, rb.skR, rb.skO = sk
+    rb._com_released = released
+    rb._exit_dump_skip_logged = skip
+    rb._comtypes_atexit_wrapped = wrapped
+    rb._faulthandler_log = handle
+
+
+class _FlushNote:
+    enabled = True
+
+    def __init__(self):
+        self.timeouts = []
+
+    def degraded_restart_failed(self, reason, **kwargs):
+        self.reason = reason
+
+    def flush(self, timeout_s=5.0):
+        self.timeouts.append(timeout_s)
+        return False
+
+
+def test_flush_false_is_logged_and_restart_failed_uses_the_long_cap(
+        monkeypatch, capsys):
+    import src.live.headless_app as ha
+    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+
+    note = _FlushNote()
+    monkeypatch.setattr(rb, "_discord", note)
+    ha._emit_restart_failed(
+        "old process still alive", detail="pid 1", bot="night1", symbol="TMF00")
+    out = capsys.readouterr().out
+    assert "discord flush False" in out and "may have been cut off" in out
+    assert note.timeouts == [FLUSH_EXIT_TIMEOUT_S]
+
+
+def test_spawn_runs_before_the_only_flush_and_that_flush_is_five_seconds(
+        tmp_path, monkeypatch):
+    """A stalling flush must not run until the replacement has been spawned."""
+    import threading
+
+    import src.live.headless_app as ha
+
+    order = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _spawn(*_a, **_k):
+        order.append("spawn")
+        return SimpleNamespace(pid=4242)
+
+    def _flush(timeout_s=5.0):
+        order.append(("enter", timeout_s))
+        entered.set()
+        release.wait(2)
+        order.append(("flush", timeout_s))
+        return True
+
+    note = _FlushNote()
+    note.flush = _flush
+    monkeypatch.setattr(rb, "_discord", note)
+    monkeypatch.setattr(ha, "spawn_detached", _spawn)
+    driver = SimpleNamespace(
+        _pending_restart_cmd=["tai", "deploy"], bot_dir=str(tmp_path),
+        args=SimpleNamespace(symbol="TMF00"))
+    box = {}
+
+    def _run():
+        try:
+            box["code"] = ha._spawn_pending_restart(driver, 0)
+        except Exception as exc:
+            box["err"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert order == ["spawn", ("enter", 5.0)]
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert box.get("err") is None and box.get("code") == 0
+    assert [item for item in order if item[0] == "flush"] == [("flush", 5.0)]
+
+
+def test_discord_warning_reaches_stdout_before_pid_wait(
+        tmp_path, monkeypatch, capsys):
+    import logging
+    import src.live.headless_app as ha
+
+    log = logging.getLogger("src.live.discord_notify")
+    saved = (log.level, list(log.handlers))
+    seen = {}
+
+    def _wait(pid, timeout_s=None):
+        seen["before"] = capsys.readouterr().out
+        log.warning("discord-before-boot")
+        return False
+
+    _patch_project(monkeypatch, tmp_path)
+    monkeypatch.setattr(dr, "wait_for_old_pid", _wait)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", lambda: {})
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("boot")))
+    try:
+        code = run_deploy(_deploy_args(tmp_path, wait_for_pid=5151)[0])
+    finally:
+        log.setLevel(saved[0])
+        log.handlers[:] = saved[1]
+    assert code != EXIT_OK
+    assert "pid-wait start old=5151" in seen["before"]
+    assert "[src.live.discord_notify] discord-before-boot" in capsys.readouterr().out
+
+
+def test_spawn_logs_the_replacement_pid_and_oserror_does_not(
+        tmp_path, monkeypatch, capsys):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    monkeypatch.setattr(rb, "_discord", None)
+    args, bot_dir = _deploy_args(tmp_path)
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+
+    def _drive(driver, _app):
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = ["tai", "deploy", "--resume"]
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a: None)
+    monkeypatch.setattr(
+        ha, "spawn_detached", lambda *_a, **_k: SimpleNamespace(pid=4242))
+    assert run_deploy(args) == EXIT_OK
+    assert "spawned replacement pid=4242" in capsys.readouterr().out
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    monkeypatch.setattr(
+        ha, "spawn_detached",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("spawn failed")))
+    assert run_deploy(args) == EXIT_BOT_STOPPED
+    assert "spawned replacement pid=" not in capsys.readouterr().out
+
+
+def test_root_destroy_is_logged_on_headless_and_gui_close(capsys):
+    import src.live.headless_app as ha
+
+    def _boom():
+        raise RuntimeError("destroy failed")
+
+    ha._teardown(SimpleNamespace(
+        root=SimpleNamespace(destroy=_boom), _shutdown_link=lambda: None))
+    assert "root.destroy done" in capsys.readouterr().out
+    gui = rb.BacktestApp.__new__(rb.BacktestApp)
+    gui._auto_save_chat = lambda: None
+    gui._shutdown_link = lambda: None
+    gui.root = SimpleNamespace(destroy=_boom)
+    gui._on_closing()
+    assert "root.destroy done" in capsys.readouterr().out
+
+
+def test_release_com_is_idempotent_and_shutdown_without_a_host_releases(capsys):
+    from run_backtest import release_com_connections
+
+    saved = _com_globals()
+    calls = []
+
+    class _Ok:
+        def disconnect(self):
+            calls.append("ok")
+
+    class _Bad:
+        def disconnect(self):
+            calls.append("bad")
+            raise RuntimeError("unadvise failed")
+
+    try:
+        rb._com_released = False
+        rb._faulthandler_log = None
+        rb._com_event_handlers[:] = [_Ok(), _Bad(), object()]
+        rb.skC = rb.skQ = rb.skR = rb.skO = "live"
+        release_com_connections()
+        out = capsys.readouterr().out
+        assert calls == ["ok", "bad"]
+        assert rb._com_event_handlers == []
+        assert rb.skC is rb.skQ is rb.skR is rb.skO is None
+        assert "COM disconnect ok=1" in out
+        release_com_connections()
+        assert calls == ["ok", "bad"]
+        assert "COM disconnect ok=" not in capsys.readouterr().out
+        text = open(os.path.join(os.path.dirname(__file__), "..", "run_backtest.py"),
+                    encoding="utf-8").read()
+        body = text[text.index("    def _stop_live("):text.index("\n# Event sinks")]
+        assert "release_com_connections" not in body
+        assert "_shutdown_link(" not in body
+
+        calls.clear()
+        rb._com_released = False
+        rb._com_event_handlers[:] = [_Ok()]
+        rb.skC = "live"
+        app = rb.BacktestApp.__new__(rb.BacktestApp)
+        app._link_host = None
+        app._cancel_reply_poll = lambda: None
+        app._shutdown_link()
+        assert calls == ["ok"] and rb.skC is None
+        assert "COM disconnect ok=1" in capsys.readouterr().out
+    finally:
+        _restore_com_globals(saved)
+
+
+def test_shutdown_arms_dump_and_return_from_main_does_not_cancel(
+        tmp_path, monkeypatch, capsys):
+    import faulthandler
+    from run_backtest import note_return_from_main
+
+    saved = _com_globals()
+    handle = open(tmp_path / "faulthandler.log", "a", encoding="utf-8")
+    order, dumps = [], []
+
+    def _dump(timeout, exit=False, file=None):
+        dumps.append((timeout, exit, file is handle))
+        order.append("dump")
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", _dump)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later",
+                        lambda: order.append("cancel"))
+
+    class _Host:
+        def shutdown(self, now):
+            order.append("leave")
+
+    class _Conn:
+        def disconnect(self):
+            order.append("disc")
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._cancel_reply_poll = lambda: None
+    try:
+        rb._faulthandler_log = handle
+        rb._exit_dump_skip_logged = False
+        rb._com_released = False
+        rb._com_event_handlers[:] = [_Conn()]
+        app._link_host = _Host()
+        app._shutdown_link()
+        assert order == ["leave", "dump", "disc"]
+        assert dumps == [(30, False, True)] and "cancel" not in order
+        saved_boot = rb._process_booted
+        rb._process_booted = True
+        try:
+            note_return_from_main()
+        finally:
+            rb._process_booted = saved_boot
+        assert "cancel" not in order
+        assert "return from main" in capsys.readouterr().out
+        order.clear()
+        dumps.clear()
+        rb._faulthandler_log = None
+        rb._exit_dump_skip_logged = False
+        rb._com_released = True
+        app._link_host = _Host()
+        app._shutdown_link()
+        assert dumps == [] and "leave" in order
+        closed = open(tmp_path / "closed.log", "a", encoding="utf-8")
+        closed.close()
+        rb._faulthandler_log = closed
+        app._shutdown_link()
+        assert dumps == []
+    finally:
+        _restore_com_globals(saved)
+        handle.close()
+
+
+def test_atexit_brackets_comtypes_shutdown(monkeypatch, capsys, tmp_path):
+    import atexit
+    import faulthandler
+    import logging
+    import sys
+    import types
+    from run_backtest import arm_process_exit_diagnostics
+
+    saved = _com_globals()
+    rb._faulthandler_log = None
+    rb._comtypes_atexit_wrapped = False
+    monkeypatch.delitem(sys.modules, "comtypes", raising=False)
+    kept = []
+    try:
+        arm_process_exit_diagnostics()
+        assert "comtypes not loaded" in capsys.readouterr().out
+        called = []
+
+        def original():
+            called.append(1)
+            if len(called) > 1:
+                raise RuntimeError("co")
+
+        mod = types.ModuleType("comtypes")
+        mod._shutdown = original
+        monkeypatch.setitem(sys.modules, "comtypes", mod)
+        atexit.register(original)
+        seen = []
+        real_reg, real_unreg = atexit.register, atexit.unregister
+        monkeypatch.setattr(
+            atexit, "register",
+            lambda fn, *a, **k: seen.append(fn) or real_reg(fn, *a, **k))
+        monkeypatch.setattr(
+            atexit, "unregister",
+            lambda fn, *a, **k: seen.append(("u", fn)) or real_unreg(fn, *a, **k))
+        rb._comtypes_atexit_wrapped = False
+        arm_process_exit_diagnostics()
+        assert ("u", original) in seen
+        wrappers = [fn for fn in seen if not isinstance(fn, tuple)]
+        assert wrappers and wrappers[0] is not original
+        kept.extend(wrappers)
+        logging.getLogger("comtypes._post_coinit.unknwn").debug(
+            "Calling CoUninitialize()")
+        assert "Calling CoUninitialize()" in capsys.readouterr().out
+        handle = open(tmp_path / "fh.log", "a", encoding="utf-8")
+        rb._faulthandler_log = handle
+        rb._exit_dump_skip_logged = False
+        dumps = []
+        monkeypatch.setattr(
+            faulthandler, "dump_traceback_later",
+            lambda timeout, exit=False, file=None: dumps.append(
+                (timeout, exit, file is handle)))
+        wrappers[-1]()
+        out = capsys.readouterr().out
+        assert dumps == [(30, False, True)]
+        assert "atexit begin" in out and "atexit end" in out and called == [1]
+        handle.close()
+        rb._exit_dump_skip_logged = False
+        dumps.clear()
+        with pytest.raises(RuntimeError, match="co"):
+            wrappers[-1]()
+        out = capsys.readouterr().out
+        assert dumps == [] and "no open handle" in out and "atexit end" in out
+        seen.clear()
+        arm_process_exit_diagnostics()
+        assert seen == []
+    finally:
+        _restore_com_globals(saved)
+        if "handle" in locals() and not handle.closed:
+            handle.close()
+        atexit.unregister(locals().get("original", lambda: None))
+        for fn in kept:
+            atexit.unregister(fn)
+        log = logging.getLogger("comtypes")
+        log.handlers[:] = [h for h in log.handlers
+                           if h.__class__.__name__ != "_AppLogHandler"]

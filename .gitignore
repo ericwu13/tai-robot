@@ -45,9 +45,10 @@ strategies/
 .DS_Store
 Thumbs.db
 
-# Claude — local/personal config stays out; shared skills/commands/agents are committed
+# Claude / Gemini — local/runtime scratch stays out; shared configs are committed
 .claude/settings.local.json
 .claude/worktrees/
+.gemini/
 
 # Tailscale / SSH local credentials (never commit)
 .claude/skills/tailscale-ssh/hosts.local.yaml

@@ -195,6 +195,7 @@ class NewsSignalPipeline:
         ]
 
         # Layer 2: 3-stage incremental sliding-window deduplication
+        prev_tiers = {c.cluster_id: c.source_tier for c in self.clusterer.active}
         dedup_decisions = self.clusterer.process_batch(l1_kept, now=now)
         l2_dups = [d for d in dedup_decisions if d.is_duplicate]
         l2_tier_upgraded = [d for d in dedup_decisions if d.tier_upgraded]
@@ -244,13 +245,20 @@ class NewsSignalPipeline:
 
         # Drop unclassified clusters that never got a vote: an API abort, or a
         # decode/schema failure. A cluster that already has classified_category
-        # stays, so a later similar article is not stuck as a duplicate.
+        # stays, so a later similar article is not stuck as a duplicate; if a
+        # Tier-3 -> Tier-1/2 upgrade failed L3, revert its source_tier so the
+        # next wire story can still upgrade and route it.
         drop_ids = unreached_cluster_ids | {dec.cluster_id for dec, _err in l3_failed_items}
         if drop_ids:
-            self.clusterer.active = [
-                c for c in self.clusterer.active
-                if not (c.cluster_id in drop_ids and not c.classified_category)
-            ]
+            upgraded_failed = {d.cluster_id for d in l2_tier_upgraded if d.cluster_id in drop_ids}
+            kept_active = []
+            for c in self.clusterer.active:
+                if c.cluster_id in drop_ids and not c.classified_category:
+                    continue
+                if c.cluster_id in upgraded_failed and c.cluster_id in prev_tiers:
+                    c.source_tier = prev_tiers[c.cluster_id]
+                kept_active.append(c)
+            self.clusterer.active = kept_active
 
         # Per-evidence decay; story age is not reset by later outlets.
         # Breadth deltas for clusters already routed; this run's new events are excluded.
