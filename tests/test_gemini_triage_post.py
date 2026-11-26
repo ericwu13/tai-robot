@@ -208,12 +208,17 @@ class TestWorkflowSecurityInvariants:
         assert triage_job["permissions"] == {"contents": "read", "issues": "read"}
         assert apply_job["permissions"] == {"contents": "read", "issues": "write"}
 
+        gate_step = next(s for s in triage_job["steps"] if s.get("id") == "gate")
+        assert "gemini-4-neon" in gate_step["run"]
+        assert "gemini-2.5-pro" not in gate_step["run"]
+
         gemini_steps = [
             s for s in triage_job["steps"]
             if str(s.get("uses", "")).startswith("google-github-actions/run-gemini-cli@")
         ]
         assert len(gemini_steps) == 1
         step = gemini_steps[0]
+        assert step["with"]["gemini_model"] == "${{ steps.gate.outputs.model }}"
         # Pinned to a 40-char commit SHA, never floating @v0/@main
         ref = step["uses"].split("@", 1)[1]
         assert len(ref) == 40 and all(c in "0123456789abcdef" for c in ref)
@@ -248,3 +253,11 @@ class TestWorkflowSecurityInvariants:
         assert mod.find_existing_triage_comment_id(comments, app_slug="tai-robot-gemini") == 22
         # Never attempts to PATCH a github-actions[bot] comment with an App token
         assert mod.find_existing_triage_comment_id(comments[:1], app_slug="tai-robot-gemini") is None
+
+    def test_format_comment_includes_model_name_when_provided(self):
+        body = mod.format_triage_comment(
+            {"summary_markdown": "## Gemini triage\nLooks like a P2."},
+            added_labels=["bug", "P2"],
+            model_name="gemini-4-neon",
+        )
+        assert "model `gemini-4-neon`" in body

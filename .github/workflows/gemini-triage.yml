@@ -41,6 +41,7 @@ jobs:
       eligible: ${{ steps.gate.outputs.eligible }}
       issue_number: ${{ steps.gate.outputs.issue_number }}
       has_result: ${{ steps.save_result.outputs.has_result }}
+      model: ${{ steps.gate.outputs.model }}
 
     steps:
       - name: Decide whether to triage
@@ -55,10 +56,14 @@ jobs:
           ISSUE_EVENT_NUM: ${{ github.event.issue.number }}
           ISSUE_INPUT_NUM: ${{ inputs.issue_number }}
           HAS_GEMINI_KEY: ${{ secrets.GEMINI_API_KEY != '' }}
+          MODEL_VAR: ${{ vars.GEMINI_TRIAGE_MODEL }}
         run: |
           set -euo pipefail
           eligible=false
           issue_num="${ISSUE_EVENT_NUM:-$ISSUE_INPUT_NUM}"
+          # Default to Gemini 4 Neon (GA coding/debugging model, 1M context, default high thinking).
+          # Override with repo variable GEMINI_TRIAGE_MODEL (e.g. gemini-4-carbon or gemini-4-hydrogen).
+          model="${MODEL_VAR:-gemini-4-neon}"
 
           if [ "$HAS_GEMINI_KEY" != "true" ]; then
             echo "GEMINI_API_KEY secret is not configured — skipping Gemini triage."
@@ -83,7 +88,8 @@ jobs:
 
           echo "eligible=$eligible" >> "$GITHUB_OUTPUT"
           echo "issue_number=$issue_num" >> "$GITHUB_OUTPUT"
-          echo "event=$EVENT_NAME action=$ACTION assoc=$AUTHOR_ASSOC follow_up=$HAS_FOLLOW_UP has_key=$HAS_GEMINI_KEY -> eligible=$eligible issue=#$issue_num"
+          echo "model=$model" >> "$GITHUB_OUTPUT"
+          echo "event=$EVENT_NAME action=$ACTION assoc=$AUTHOR_ASSOC follow_up=$HAS_FOLLOW_UP has_key=$HAS_GEMINI_KEY model=$model -> eligible=$eligible issue=#$issue_num"
 
       - name: Checkout master (read-only)
         if: steps.gate.outputs.eligible == 'true'
@@ -112,7 +118,7 @@ jobs:
         with:
           gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
           gemini_cli_version: "0.71.1"
-          gemini_model: ${{ vars.GEMINI_TRIAGE_MODEL }}
+          gemini_model: ${{ steps.gate.outputs.model }}
           github_issue_number: ${{ steps.gate.outputs.issue_number }}
           workflow_name: gemini-triage
           settings: |-
@@ -231,5 +237,6 @@ jobs:
           APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           ISSUE: ${{ needs.triage.outputs.issue_number }}
+          GEMINI_MODEL: ${{ needs.triage.outputs.model }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: python3 .github/scripts/gemini_triage_post.py apply "$RUNNER_TEMP/gemini-triage/result.txt"
