@@ -174,6 +174,11 @@ class TestClaudeWorkflowSecurityInvariants:
         assert "CLAUDE_REVIEW_APP_ID" in review_job["env"]
         assert "CLAUDE_REVIEW_APP_ID" in resolve_job["env"]
 
+        gate_step = next(s for s in review_job["steps"] if s.get("id") == "gate")
+        assert "claude-opus-5-5" in gate_step["run"]
+        assert "CLAUDE_REVIEW_MODEL" in gate_step["env"]["MODEL_VAR"]
+        assert "CLAUDE_REVIEW_EFFORT" in gate_step["env"]["EFFORT_VAR"]
+
         claude_steps = [
             s for s in review_job["steps"]
             if str(s.get("uses", "")).startswith("anthropics/claude-code-action@")
@@ -182,8 +187,11 @@ class TestClaudeWorkflowSecurityInvariants:
         for step in claude_steps:
             assert step["env"]["GH_TOKEN"] == "${{ github.token }}"
             assert "app-token" not in json.dumps(step)
+            assert "--model ${{ steps.gate.outputs.model }}" in step["with"]["claude_args"]
+            assert "--effort ${{ steps.gate.outputs.effort }}" in step["with"]["claude_args"]
 
         post_steps = [s for s in review_job["steps"] if s.get("id") == "post"]
         assert len(post_steps) == 1
         assert "steps.app-token.outputs.token" in post_steps[0]["env"]["GH_TOKEN"]
         assert post_steps[0]["env"]["APP_SLUG"] == "${{ steps.app-token.outputs.app-slug }}"
+        assert post_steps[0]["env"]["CLAUDE_MODEL"] == "${{ steps.gate.outputs.model }}"
