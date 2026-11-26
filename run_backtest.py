@@ -1206,6 +1206,13 @@ def _log(msg):
     _route_to_log_widget(line, "info")
 
 
+def _safe_log(msg: str) -> None:
+    try:
+        _log(msg)
+    except Exception:
+        pass
+
+
 class _AppLogHandler(logging.Handler):
     """Routes Python logging records into the app's _log() function."""
     def emit(self, record):
@@ -1225,11 +1232,7 @@ _APP_LOG_NAMES = (
 
 
 def attach_app_log_handlers(names=_APP_LOG_NAMES) -> None:
-    """Route live-module logs through ``_log`` (stdout, flush=True).
-
-    Idempotent. Called from deploy and, earlier, from a headless waiter
-    that has not reached ``_deploy_live_continue`` yet.
-    """
+    """Route these logs through ``_log``. Idempotent."""
     for logger_name in names:
         mod_logger = logging.getLogger(logger_name)
         if any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
@@ -3063,20 +3066,9 @@ class BacktestApp:
         # apartment is still alive, then Unadvise, then drop the refs.
         try:
             arm_process_exit_diagnostics()
-        except Exception as e:
-            try:
-                _log(f"[HEADLESS] exit diagnostics failed: "
-                     f"[{type(e).__name__}] {e}")
-            except Exception:
-                pass
-        try:
             release_com_connections()
         except Exception as e:
-            try:
-                _log(f"[HEADLESS] COM release failed: "
-                     f"[{type(e).__name__}] {e}")
-            except Exception:
-                pass
+            _safe_log(f"[HEADLESS] COM release failed: [{type(e).__name__}] {e}")
 
     def _on_reconnected(self):
         """Resubscribe after the machine has seen quote READY (3003).
@@ -4662,10 +4654,7 @@ class BacktestApp:
             self.root.destroy()
         except Exception:
             pass
-        try:
-            _log("[HEADLESS] root.destroy done")
-        except Exception:
-            pass
+        _safe_log("[HEADLESS] root.destroy done")
 
     # ══════════════════════════════════════════════════════════════
     #  SELF-UPDATE
@@ -13848,7 +13837,6 @@ def register_com_events() -> None:
 
 
 def _comtypes_shutdown_fn():
-    """The callable comtypes registered with atexit, or None."""
     mod = sys.modules.get("comtypes")
     fn = getattr(mod, "_shutdown", None) if mod is not None else None
     if callable(fn):
@@ -13861,7 +13849,6 @@ def _comtypes_shutdown_fn():
 
 
 def _attach_comtypes_log_handler() -> None:
-    """DEBUG on the comtypes logger, through ``_log``. Once."""
     log = logging.getLogger("comtypes")
     if not any(isinstance(h, _AppLogHandler) for h in log.handlers):
         handler = _AppLogHandler()
@@ -13871,147 +13858,80 @@ def _attach_comtypes_log_handler() -> None:
 
 
 def _arm_exit_traceback_dump() -> None:
-    """30s hang dump into the existing faulthandler handle. Never opens a file."""
     global _exit_dump_skip_logged
     handle = _faulthandler_log
-    open_ok = handle is not None and not getattr(handle, "closed", True)
-    if not open_ok:
-        if _exit_dump_skip_logged:
-            return
-        _exit_dump_skip_logged = True
-        try:
-            _log("[HEADLESS] faulthandler exit dump skipped: no open handle")
-        except Exception:
-            pass
+    if handle is None or getattr(handle, "closed", True):
+        if not _exit_dump_skip_logged:
+            _exit_dump_skip_logged = True
+            _safe_log("[HEADLESS] faulthandler exit dump skipped: no open handle")
         return
     try:
         faulthandler.dump_traceback_later(30, exit=False, file=handle)
     except Exception as exc:
-        try:
-            _log(f"[HEADLESS] faulthandler exit dump not armed: "
-                 f"[{type(exc).__name__}] {exc}")
-        except Exception:
-            pass
+        _safe_log(
+            f"[HEADLESS] faulthandler exit dump not armed: "
+            f"[{type(exc).__name__}] {exc}")
 
 
 def _arm_comtypes_atexit() -> None:
-    """Bracket comtypes ``CoUninitialize`` with atexit begin/end. Once."""
     global _comtypes_atexit_wrapped
     if _comtypes_atexit_wrapped:
         return
     _comtypes_atexit_wrapped = True
     if "comtypes" not in sys.modules:
-        try:
-            _log("[HEADLESS] comtypes not loaded; "
-                 "skip atexit CoUninitialize wrap")
-        except Exception:
-            pass
+        _safe_log("[HEADLESS] comtypes not loaded; "
+                  "skip atexit CoUninitialize wrap")
         return
     try:
         _attach_comtypes_log_handler()
     except Exception:
         pass
     original = _comtypes_shutdown_fn()
-    if original is None:
-        try:
-            _log("[HEADLESS] comtypes _shutdown missing; skip atexit wrap")
-        except Exception:
-            pass
+    if not callable(original):
+        _safe_log("[HEADLESS] comtypes _shutdown missing; skip atexit wrap")
         return
     try:
         atexit.unregister(original)
-    except Exception as exc:
-        try:
-            _log(f"[HEADLESS] atexit unregister failed: "
-                 f"[{type(exc).__name__}] {exc}")
-        except Exception:
-            pass
-        return
-
-    def _wrapped() -> None:
-        try:
-            _log("atexit begin")
-        except Exception:
-            pass
-        try:
-            original()
-        finally:
+        def _wrapped() -> None:
+            _safe_log("atexit begin")
             try:
-                _log("atexit end")
-            except Exception:
-                pass
-
-    try:
+                original()
+            finally:
+                _safe_log("atexit end")
         atexit.register(_wrapped)
     except Exception as exc:
-        try:
-            _log(f"[HEADLESS] atexit register failed: "
-                 f"[{type(exc).__name__}] {exc}")
-        except Exception:
-            pass
+        _safe_log(
+            f"[HEADLESS] atexit wrap failed: [{type(exc).__name__}] {exc}")
 
 
 def arm_process_exit_diagnostics() -> None:
-    """After LeaveMonitor, before Unadvise. Never raises."""
-    try:
-        _arm_exit_traceback_dump()
-    except Exception as exc:
-        try:
-            _log(f"[HEADLESS] exit dump arm failed: "
-                 f"[{type(exc).__name__}] {exc}")
-        except Exception:
-            pass
-    try:
-        _arm_comtypes_atexit()
-    except Exception as exc:
-        try:
-            _log(f"[HEADLESS] comtypes atexit arm failed: "
-                 f"[{type(exc).__name__}] {exc}")
-        except Exception:
-            pass
+    _arm_exit_traceback_dump()
+    _arm_comtypes_atexit()
 
 
 def release_com_connections() -> None:
-    """Unadvise event sinks and drop SKCOM refs. Idempotent. Never raises."""
     global _com_released, skC, skQ, skR, skO
     if _com_released:
         return
     _com_released = True
     ok = 0
-    try:
-        handlers = list(_com_event_handlers)
-    except Exception:
-        handlers = []
-    for obj in handlers:
+    for obj in list(_com_event_handlers):
         disconnect = getattr(obj, "disconnect", None)
         if not callable(disconnect):
             continue
         try:
             disconnect()
+            ok += 1
         except Exception:
-            continue
-        ok += 1
-    try:
-        _com_event_handlers.clear()
-    except Exception:
-        pass
+            pass
+    _com_event_handlers.clear()
     skC = skQ = skR = skO = None
-    try:
-        _log(f"[HEADLESS] COM disconnect ok={ok}")
-    except Exception:
-        pass
+    _safe_log(f"[HEADLESS] COM disconnect ok={ok}")
 
 
 def note_return_from_main() -> None:
-    """Log that main is returning and cancel the post-LeaveMonitor hang dump.
-
-    Cancel only here. A hang inside destroy, flush, or CoUninitialize
-    must still dump.
-    """
-    try:
-        _log("[HEADLESS] return from main")
-    except Exception:
-        pass
+    """Cancel the hang dump once main is actually returning."""
+    _safe_log("[HEADLESS] return from main")
     try:
         faulthandler.cancel_dump_traceback_later()
     except Exception:
@@ -14028,10 +13948,7 @@ def main():
     root = tk.Tk()
     app = BacktestApp(root)
     root.mainloop()
-    try:
-        note_return_from_main()
-    except Exception:
-        pass
+    note_return_from_main()
 
 
 if __name__ == "__main__":
@@ -14048,10 +13965,7 @@ if __name__ == "__main__":
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
         _code = run_bot_cli.main(routed)
-        try:
-            note_return_from_main()
-        except Exception:
-            pass
+        note_return_from_main()
         sys.exit(_code)
     if kind != "gui":
         raise SystemExit(0)

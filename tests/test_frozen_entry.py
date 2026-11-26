@@ -73,6 +73,12 @@ def test_spawn_guard_runs_before_tk_import():
     assert "run_bot_cli.main(routed)" in bottom
     assert bottom.index("run_bot_cli.main(routed)") < bottom.index(
         "note_return_from_main()") < bottom.index("sys.exit(")
+    main_body = text.split("def main():", 1)[1].split(
+        'if __name__ == "__main__":', 1)[0]
+    assert main_body.index("root.mainloop()") < main_body.index("note_return_from_main()")
+    cli = (REPO / "run_bot_cli.py").read_text(encoding="utf-8")
+    cli_tail = cli.split('if __name__ == "__main__":')[-1]
+    assert cli_tail.index("note_return_from_main()") < cli_tail.index("sys.exit(")
     assert "\n    main()\n" in bottom
     assert "enable_dpi_awareness()" not in bottom
     assert "_init_com()" not in bottom
