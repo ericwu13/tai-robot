@@ -60,7 +60,9 @@ jobs:
         run: |
           set -euo pipefail
           eligible=false
-          model="${MODEL_VAR:-gemini-2.5-pro}"
+          # Default to Gemini 4 Neon (GA coding/debugging model, 1M context, default high thinking).
+          # Override with repo variable GEMINI_REVIEW_MODEL (e.g. gemini-4-carbon or gemini-4-hydrogen).
+          model="${MODEL_VAR:-gemini-4-neon}"
           if [ "$HAS_GEMINI_KEY" != "true" ]; then
             echo "GEMINI_API_KEY secret is not configured — skipping Gemini PR review."
           elif [ "$SAME_REPO" = "true" ]; then

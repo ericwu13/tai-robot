@@ -229,6 +229,7 @@ def format_triage_comment(
     *,
     added_labels: list[str],
     run_url: str = "",
+    model_name: str = "",
 ) -> str:
     """Build the single edit-in-place triage comment markdown."""
     summary = str(data.get("summary_markdown") or "").replace(MARKER, "").strip()
@@ -239,6 +240,8 @@ def format_triage_comment(
         summary = f"## Gemini triage\n\n{summary}"
 
     footer_parts = ["Automated read-only triage via Gemini CLI"]
+    if model_name:
+        footer_parts.append(f"model `{model_name}`")
     if added_labels:
         footer_parts.append("labels added: " + ", ".join(f"`{lb}`" for lb in added_labels))
     else:
@@ -284,6 +287,7 @@ def apply_triage(
     *,
     run_url: str = "",
     app_slug: str = "",
+    model_name: str = "",
 ) -> dict[str, Any]:
     raw_text = Path(result_path).read_text(encoding="utf-8")
     data = extract_json_object(raw_text)
@@ -311,7 +315,9 @@ def apply_triage(
         repo_labels=repo_labels,
     )
 
-    body = format_triage_comment(data, added_labels=to_add, run_url=run_url)
+    body = format_triage_comment(
+        data, added_labels=to_add, run_url=run_url, model_name=model_name,
+    )
 
     if to_add:
         gh_api(
@@ -361,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             path,
             run_url=os.environ.get("RUN_URL", "").strip(),
             app_slug=os.environ.get("APP_SLUG", "").strip(),
+            model_name=os.environ.get("GEMINI_MODEL", "").strip(),
         )
     return 0
 
