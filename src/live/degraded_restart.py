@@ -14,6 +14,7 @@ an OS file lock under the deploy root so a crash cannot leave a holder.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -28,6 +29,9 @@ from .session_store import load_session, save_session
 from .tick_watchdog import TickWatchdog
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
+
+logger = logging.getLogger(__name__)
+_snapshot_error: str | None = None
 
 AUTO_RESTART_FILENAME = "auto_restart.json"
 RELOGIN_SLOT_NAME = ".relogin.slot"
@@ -205,14 +209,23 @@ def wait_for_old_pid(pid: int, *, timeout_s: float = PID_WAIT_S,
 
 
 def _snapshot_degraded(app) -> bool:
+    global _snapshot_error
     host = getattr(app, "_link_host", None)
     snap = getattr(host, "snapshot", None)
     if not callable(snap):
         return False
     try:
         data = snap()
-    except Exception:
+    except Exception as exc:
+        name = type(exc).__name__
+        if name != _snapshot_error:
+            _snapshot_error = name
+            logger.warning(
+                "degraded-restart: link snapshot raised %s; treating as not degraded",
+                name,
+            )
         return False
+    _snapshot_error = None
     if not isinstance(data, dict):
         return False
     return bool(data.get("degraded"))

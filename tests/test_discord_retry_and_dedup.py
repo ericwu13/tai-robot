@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 import time
+from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -403,3 +405,151 @@ class TestDailyReportSessionDedup:
         assert "last_report_key" in saved
         assert saved["last_report_key"] == "2026-07-24_NIGHT"
         assert "last_report_date" not in saved
+
+    def test_sent_report_skip_is_logged_once(self, caplog):
+        """Three repeats of a sent key log one skip line; a new key logs again."""
+        _assert_sent_skip_logged_once(
+            self._make_runner(("2026-07-24", "DAY")),
+            "src.live.live_runner",
+            caplog,
+        )
+
+    def test_no_trades_is_logged_once(self, caplog):
+        """A None report logs once per key and still does not emit."""
+        _assert_no_trades_logged_once(
+            self._make_runner(("2026-07-24", "DAY")),
+            "src.live.live_runner",
+            caplog,
+        )
+
+
+def _info_records(caplog, logger_name, text):
+    return [
+        rec for rec in caplog.records
+        if rec.name == logger_name and rec.levelno == logging.INFO
+        and text in rec.getMessage()
+    ]
+
+
+def _assert_sent_skip_logged_once(runner, logger_name, caplog):
+    report = {"date": "2026-07-24", "strategy": {"name": "T"}}
+    day = TestDailyReportSessionDedup._mock_session("2026-07-24", "DAY")
+    night = TestDailyReportSessionDedup._mock_session("2026-07-24", "NIGHT")
+    gen = "src.daily_report.report_generator.generate_session_report"
+    cur = "src.regime.switch_logic.current_session"
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        with patch(gen, return_value=dict(report)) as generated, patch(
+            cur, return_value=day,
+        ):
+            runner._generate_daily_report()
+            for _ in range(3):
+                runner._generate_daily_report()
+            assert generated.call_count == 1
+        assert runner._last_report_key == "2026-07-24_DAY"
+        assert len(runner._events["on_daily_report"]) == 1
+        skips = _info_records(caplog, logger_name, "already sent")
+        assert len(skips) == 1
+        assert skips[0].getMessage() == (
+            "daily report skipped: key 2026-07-24_DAY already sent "
+            "(bot=test_bot)")
+
+        runner._events.clear()
+        runner._sk = ("2026-07-24", "NIGHT")
+        with patch(gen, return_value=dict(report)) as generated, patch(
+            cur, return_value=night,
+        ):
+            runner._generate_daily_report()
+            for _ in range(3):
+                runner._generate_daily_report()
+            assert generated.call_count == 1
+        assert runner._last_report_key == "2026-07-24_NIGHT"
+        assert len(runner._events["on_daily_report"]) == 1
+        skips = _info_records(caplog, logger_name, "already sent")
+        assert len(skips) == 2
+        assert "key 2026-07-24_NIGHT already sent" in skips[1].getMessage()
+
+
+def _assert_no_trades_logged_once(runner, logger_name, caplog):
+    day = TestDailyReportSessionDedup._mock_session("2026-07-24", "DAY")
+    night = TestDailyReportSessionDedup._mock_session("2026-07-24", "NIGHT")
+    gen = "src.daily_report.report_generator.generate_session_report"
+    cur = "src.regime.switch_logic.current_session"
+    with caplog.at_level(logging.INFO, logger=logger_name):
+        with patch(gen, return_value=None) as generated, patch(
+            cur, return_value=day,
+        ):
+            for _ in range(3):
+                runner._generate_daily_report()
+            assert generated.call_count == 3
+        assert runner._last_report_key is None
+        assert "on_daily_report" not in runner._events
+        notes = _info_records(caplog, logger_name, "no completed trades")
+        assert len(notes) == 1
+        assert notes[0].getMessage() == (
+            "daily report not generated: no completed trades for key "
+            "2026-07-24_DAY (bot=test_bot)")
+
+        runner._sk = ("2026-07-24", "NIGHT")
+        with patch(gen, return_value=None) as generated, patch(
+            cur, return_value=night,
+        ):
+            runner._generate_daily_report()
+            runner._generate_daily_report()
+            assert generated.call_count == 2
+        assert runner._last_report_key is None
+        assert "on_daily_report" not in runner._events
+        notes = _info_records(caplog, logger_name, "no completed trades")
+        assert len(notes) == 2
+        assert "2026-07-24_NIGHT" in notes[1].getMessage()
+
+
+class TestRegimeDailyReportSkipLog:
+    """The regime override is a copy of the same two silent returns."""
+
+    def _make_runner(self, session_key=("2026-07-24", "DAY")):
+        from src.live.regime_switching_runner import RegimeSwitchingRunner
+
+        class StubRunner(RegimeSwitchingRunner):
+            def __init__(self, sk):
+                self._last_report_key = None
+                self._session_path = None
+                self._events = {}
+                self._sk = sk
+                self.broker = MagicMock()
+                self.data_store = None
+                self.strategy_display_name = "TestStrat"
+                self.strategy = MagicMock(params=None)
+                self.point_value = 1
+                self.symbol = "TXF1"
+                self.bot_name = "test_bot"
+                self._started_at = "2026-07-24T08:45:00"
+                self._active_leg = "long"
+                self._long_strategy_name = "LongLeg"
+                self._short_strategy_name = "ShortLeg"
+                self._manager = SimpleNamespace(
+                    _state=SimpleNamespace(effective_regime="trending-up"))
+
+            def _session_key(self):
+                return self._sk
+
+            def _auto_save_session(self):
+                pass
+
+            def _emit(self, event, *args):
+                self._events.setdefault(event, []).append(args)
+
+        return StubRunner(session_key)
+
+    def test_sent_report_skip_is_logged_once(self, caplog):
+        _assert_sent_skip_logged_once(
+            self._make_runner(("2026-07-24", "DAY")),
+            "src.live.regime_switching_runner",
+            caplog,
+        )
+
+    def test_no_trades_is_logged_once(self, caplog):
+        _assert_no_trades_logged_once(
+            self._make_runner(("2026-07-24", "DAY")),
+            "src.live.regime_switching_runner",
+            caplog,
+        )
