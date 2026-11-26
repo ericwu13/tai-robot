@@ -130,7 +130,8 @@ from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
-    open_interest_query_rejected,
+    OI_QUERY_MIN_INTERVAL_S, open_interest_query_rejected,
+    sleep_open_interest_interval, wait_open_interest_spacing,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.broker_port import DEFAULT_BROKER_MODE, require_inprocess
@@ -1234,6 +1235,7 @@ _APP_LOG_NAMES = (
     "src.live.loss_baseline",
     "src.live.position_log",
     "src.live.degraded_restart",
+    "src.live.leftover_sweep",
 )
 
 
@@ -1720,6 +1722,9 @@ class BacktestApp:
         _app = self
 
         self.root = root
+        # Last bot this process deployed. _stop_live does not clear it:
+        # _shutdown_link writes .exiting here after the runner is gone.
+        self._exit_marker_dir = None
         # HeadlessBotApp sets ``policy`` before delegating here. Headless
         # bots get no theme at all: widget construction stays identical to
         # the unthemed app and the live path does zero extra work.
@@ -3069,7 +3074,14 @@ class BacktestApp:
 
         Then arm the exit dump and release COM. ``_stop_live`` does not
         call this: a GUI Stop Bot keeps the process and its COM alive.
+        The exit marker names ``_exit_marker_dir`` (the last deploy).
+        Unset means this process never deployed, so nothing is written.
         """
+        try:
+            from src.live.leftover_sweep import write_exiting_marker
+            write_exiting_marker(getattr(self, "_exit_marker_dir", None))
+        except Exception:
+            pass
         self._cancel_reply_poll()
         host = getattr(self, "_link_host", None)
         if host is not None:
@@ -9850,12 +9862,31 @@ class BacktestApp:
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
+                # Capital wants >= 5s between GetOpenInterestGW calls. The
+                # OnComplete reconcile in this process often lands well
+                # inside that gap. Only this pre-deploy call waits; rights,
+                # mode-request, and the account poll are not spaced here.
+                wait_open_interest_spacing()
                 # New generation. clear_positions() must not be what drops
                 # the previous answer; only this query can complete it.
                 self._account_monitor.begin_oi_query()
                 code = _broker.get_open_interest(
                     user_id, self._futures_account, 1)
                 _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — retry once after "
+                        f"{OI_QUERY_MIN_INTERVAL_S:.0f}s"
+                    )
+                    sleep_open_interest_interval()
+                    self._account_monitor.begin_oi_query()
+                    code = _broker.get_open_interest(
+                        user_id, self._futures_account, 1)
+                    _log(
+                        "部署前持倉查詢 Pre-deploy GetOpenInterestGW retry: "
+                        f"code={code}"
+                    )
                 if open_interest_query_rejected(code):
                     self._predeploy_oi_failed = True
                     self._predeploy_oi_unknown_reason = (
@@ -9946,6 +9977,8 @@ class BacktestApp:
             )
             self._regime_manager = None
         self._live_runner.acquire_lock()
+        # Last bot this process deployed. _stop_live does not clear it.
+        self._exit_marker_dir = self._live_runner.bot_dir
         self._position_ledger = PositionLedger(
             self._live_runner.bot_dir,
             bot_id=os.path.basename(os.path.normpath(self._live_runner.bot_dir)),
@@ -10018,7 +10051,8 @@ class BacktestApp:
         # Route Discord and LiveRunner logging into the app's _log()
         attach_app_log_handlers()
 
-        # Initialize Discord notifications
+        # Initialize Discord notifications. A pre-boot alert may already
+        # have installed the worker; replacing it would leak that client.
         global _discord
         from src.live.discord_notify import DiscordNotifier
         bot_token = self._settings.get("discord_bot_token", "")
@@ -10029,11 +10063,22 @@ class BacktestApp:
             "discord_daily_report_channel_id", "")
         regime_channel_id = self._settings.get(
             "discord_regime_channel_id", "")
-        _discord = DiscordNotifier(bot_token, channel_id,
-                                   bot_name=bot_name, symbol=symbol,
-                                   evolution_channel_id=evolution_channel_id,
-                                   daily_report_channel_id=daily_report_channel_id,
-                                   regime_channel_id=regime_channel_id)
+        if isinstance(_discord, DiscordNotifier):
+            _discord._bot_name = bot_name
+            _discord._symbol = symbol
+            _discord._evolution_channel_id = (
+                evolution_channel_id.strip() if evolution_channel_id else "")
+            _discord._daily_report_channel_id = (
+                daily_report_channel_id.strip() if daily_report_channel_id else "")
+            _discord._regime_channel_id = (
+                regime_channel_id.strip() if regime_channel_id else "")
+        else:
+            _discord = DiscordNotifier(
+                bot_token, channel_id,
+                bot_name=bot_name, symbol=symbol,
+                evolution_channel_id=evolution_channel_id,
+                daily_report_channel_id=daily_report_channel_id,
+                regime_channel_id=regime_channel_id)
         _deploy_mode_zh = {"paper": "模擬", "semi_auto": "半自動",
                            "auto": "全自動"}.get(trading_mode, trading_mode)
         if _discord.enabled:

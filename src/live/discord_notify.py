@@ -685,6 +685,24 @@ class DiscordNotifier:
             priority=True,
         )
 
+    def degraded_restart_still_waiting(self, *, old_pid: int, waited_s: float,
+                                       bot: str = "") -> None:
+        """The old process is still alive after the first pid wait.
+
+        This is not a give-up. Operators must be able to tell "still
+        waiting" from ``degraded_restart_failed``.
+        """
+        who = f"機器人 Bot: `{bot}`\n" if bot else ""
+        seconds = int(waited_s)
+        self._send(
+            f"{self._header()}\n"
+            f"⏳ **仍在等待舊行程 Still waiting for old process**\n"
+            f"{who}"
+            f"舊行程 old pid: {int(old_pid)} | 已等待 waited: {seconds}s\n"
+            f"繼續等到該行程結束，或直到時段剩餘時間不足以重啟。",
+            priority=True,
+        )
+
     def mode_switched(self, old_mode: str, new_mode: str) -> None:
         """Notify a live hot-swap of the trading mode.
 

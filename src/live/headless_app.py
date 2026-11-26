@@ -705,7 +705,17 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     if not token or not channel:
         return None
     from src.live.discord_notify import DiscordNotifier
-    return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
+    # One notifier for this process. A second call (still-waiting, then
+    # the give-up) must flush the same worker, and deploy keeps it.
+    notifier = DiscordNotifier(
+        token, channel, bot_name=bot, symbol=symbol,
+        evolution_channel_id=str(cfg.get("discord_evolution_channel_id") or ""),
+        daily_report_channel_id=str(
+            cfg.get("discord_daily_report_channel_id") or ""),
+        regime_channel_id=str(cfg.get("discord_regime_channel_id") or ""),
+    )
+    rb._discord = notifier
+    return notifier
 
 
 # ce93800a flushed 5s after spawn. The child is already in wait_for_old_pid.
@@ -732,6 +742,39 @@ def _log_discord_flush(discord, timeout_s: float) -> bool:
 
 def _flush_discord(discord) -> None:
     _log_discord_flush(discord, _POST_SPAWN_FLUSH_S)
+
+
+def _emit_restart_still_waiting(old_pid: int, waited_s: float, *,
+                                bot: str = "", symbol: str = "",
+                                order_symbol: str = "") -> None:
+    """Priority "still waiting" alert. Does not clear ``pending_notify``.
+
+    Distinct from ``_emit_restart_failed`` so operators can tell a live
+    wait from a give-up. The worker sends it. This path does not flush:
+    a stall here used to hold the poll after the old pid had already exited.
+    ``order_symbol`` is the close the continued wait will measure.
+    """
+    order = f" order={order_symbol}" if order_symbol else ""
+    rb._safe_log(
+        f"[HEADLESS] pid-wait still waiting old={old_pid} "
+        f"after {int(waited_s)}s symbol={symbol}{order}"
+    )
+    discord = _resolve_discord(bot=bot, symbol=symbol)
+    if discord is None or not getattr(discord, "enabled", False):
+        return
+    try:
+        method = getattr(discord, "degraded_restart_still_waiting", None)
+        if callable(method):
+            method(old_pid=int(old_pid), waited_s=float(waited_s), bot=bot)
+        else:
+            discord.notify(
+                f"仍在等待舊行程 Still waiting for old process "
+                f"pid {old_pid} after {int(waited_s)}s",
+                priority=True,
+            )
+    except Exception as exc:
+        rb._safe_log(f"[HEADLESS] still-waiting alert failed: "
+                     f"[{type(exc).__name__}] {exc}")
 
 
 def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
@@ -805,7 +848,8 @@ def _spawn_pending_restart(driver, code: int) -> int:
 def run_deploy(args) -> int:
     from src.live.degraded_restart import (
         DEFAULT_RELOGIN_WAIT_S, PID_WAIT_S, acquire_relogin_slot,
-        clear_pending_notify, release_relogin_slot, wait_for_old_pid,
+        clear_pending_notify, poll_old_pid_until_exit_or_budget,
+        release_relogin_slot, wait_for_old_pid,
     )
 
     bot_dir = _deploy_bot_dir(args)
@@ -816,16 +860,41 @@ def run_deploy(args) -> int:
         # Before _boot, so a pid-wait warning is on stdout. Deploy's
         # own attach runs only after the wait succeeds.
         rb.attach_app_log_handlers()
+        started = time.monotonic()
         rb._safe_log(f"[HEADLESS] pid-wait start old={old_pid}")
+        # The 60s primitive stays. A miss does not give up and does not
+        # clear pending_notify: the recovery line still has to fire if
+        # this process later reaches tick subscription.
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
-            _emit_restart_failed(
-                "old process still alive",
-                detail=f"pid {old_pid} still alive after {int(PID_WAIT_S)}s",
-                bot=bot_name,
-                symbol=symbol,
-            )
-            clear_pending_notify(bot_dir)
-            return EXIT_TIMEOUT
+            # Same symbol observe_app uses (watchdog.order_symbol).
+            # TMF00 keeps a 13:45 close; its order symbol TM0000
+            # settles at 13:30.
+            from src.market_data.kline_config import resolve_order_symbol
+            order_symbol = resolve_order_symbol(symbol) if symbol else symbol
+            _emit_restart_still_waiting(
+                old_pid, PID_WAIT_S, bot=bot_name, symbol=symbol,
+                order_symbol=order_symbol)
+            outcome, mins_left = poll_old_pid_until_exit_or_budget(
+                old_pid, order_symbol)
+            if outcome == "budget":
+                waited_s = max(0.0, time.monotonic() - started)
+                rb._safe_log(
+                    f"[HEADLESS] pid-wait budget gone old={old_pid} "
+                    f"symbol={symbol} order={order_symbol} "
+                    f"mins_left={mins_left} waited={int(waited_s)}s"
+                )
+                _emit_restart_failed(
+                    "old process still alive",
+                    detail=(f"pid {old_pid} still alive after "
+                            f"{int(waited_s)}s order={order_symbol}"),
+                    bot=bot_name,
+                    symbol=symbol,
+                )
+                clear_pending_notify(bot_dir)
+                return EXIT_TIMEOUT
+            exited = rb._taipei_now().strftime("%Y-%m-%d %H:%M:%S")
+            rb._safe_log(
+                f"[HEADLESS] old pid {old_pid} exited at {exited} TPE")
     stagger = bool(getattr(args, "relogin_stagger", False))
     held_slot = False
     if stagger:
