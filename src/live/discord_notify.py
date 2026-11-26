@@ -42,13 +42,13 @@ HTTP_TIMEOUT_S = 10.0
 CONNECT_TIMEOUT_S = 5.0
 SEND_QUEUE_MAX = 200
 PRIORITY_BACKLOG_MAX = 200
-# A send that raises, or whose ``_deliver`` returns False, is put back
-# this many times, then abandoned so the next notification still goes out.
-# Zero would drop it on the first error.
+# A retryable False (429, 5xx, connection/timeout) is put back this many
+# times. Any other 4xx is final. Zero drops the send on the first error.
 WORKER_SEND_RETRIES = 1
-# Exit flush waits one ``_deliver`` 429 cycle (3 posts + 1s/2s/4s) for the
-# original send and one worker retry, plus connect. The old process caps
-# this further so the flush cannot eat the child's pid wait.
+# Best-effort: one 1/2/4s cycle, one worker retry, plus connect.
+# Retry-After can stretch a sleep to RETRY_AFTER_SLEEP_CAP_S and outlast
+# this; flush returns False and the caller logs that the send may have
+# been cut off. This bound is not raised to cover that header.
 FLUSH_EXIT_TIMEOUT_S = (
     (HTTP_TIMEOUT_S * 3 + 1 + 2 + 4) * (1 + WORKER_SEND_RETRIES)
     + CONNECT_TIMEOUT_S
@@ -70,18 +70,9 @@ def _taipei_now() -> datetime:
 
 def _retry_after_sleep_s(resp, delay: float) -> float:
     """Seconds to sleep after one HTTP 429. Unparsable keeps ``delay``."""
-    raw = None
-    headers = getattr(resp, "headers", None)
-    if headers is not None:
-        try:
-            raw = headers.get("Retry-After")
-        except Exception:
-            raw = None
-    if raw is None:
-        return delay
     try:
-        parsed = float(str(raw).strip())
-    except (TypeError, ValueError):
+        parsed = float(str(resp.headers.get("Retry-After")).strip())
+    except Exception:
         return delay
     return min(RETRY_AFTER_SLEEP_CAP_S, max(float(delay), parsed))
 
@@ -157,11 +148,9 @@ class DiscordNotifier:
         are dropped only when that deque is full. The default stays
         routine so a caller that does not opt in cannot fill that deque.
 
-        HTTP 429 is retried inside ``_deliver`` (backoff 1s, 2s, 4s, or
-        ``Retry-After`` when that header is longer, capped at 15s), not by
-        enqueueing again, so a retry cannot be dropped because the queue
-        is full. A False return is one worker retry
-        (``WORKER_SEND_RETRIES``).
+        HTTP 429 is retried inside ``_deliver`` (1s, 2s, 4s, or Retry-After
+        capped at 15s), not by enqueueing again. The worker retries one
+        more time for 429, 5xx, and transport errors. Any other 4xx is final.
         """
         if not self.enabled:
             return
@@ -276,9 +265,7 @@ class DiscordNotifier:
                     item, from_backlog, queued = self._next_item()
                     content, target = item[0], item[1]
                     ok = self._deliver(content, target)
-                    # False is a failed POST. ``_deliver`` catches network
-                    # errors and does not raise, so the retry has to see it.
-                    sent_ok = bool(ok)
+                    sent_ok = bool(ok)  # False is a failed POST; it does not raise
                     waited = item[4] if len(item) > 4 else False
                     if from_backlog and ok and waited:
                         with self._state_lock:
@@ -290,12 +277,9 @@ class DiscordNotifier:
                 except Exception:
                     logger.exception(
                         "Discord worker error (bot=%s)", self._bot_name)
-                # The item was already popped. Put it back once so a
-                # transient error or a False delivery does not lose it.
-                # A second failure is abandoned. Requeue before the
-                # finally block clears ``_in_flight``, or flush can
-                # return while this send is still pending.
-                if item is not None and not sent_ok:
+                # Requeue before finally clears _in_flight. A final 4xx does not.
+                if (item is not None and not sent_ok
+                        and not getattr(self, "_skip_worker_retry", False)):
                     self._retry_failed_item(item, from_backlog)
             finally:
                 with self._state_lock:
@@ -378,11 +362,11 @@ class DiscordNotifier:
     def _deliver(self, content: str, target: str) -> bool:
         """POST one message. Retry HTTP 429 with backoff 1s, 2s, 4s.
 
-        A 429 ``Retry-After`` in seconds raises that one sleep, capped at
-        ``RETRY_AFTER_SLEEP_CAP_S``. An unparsable header keeps the backoff.
+        A 429 Retry-After (seconds) raises that sleep, capped at 15s.
         Returns True when Discord accepted the message. The lock is not
         held across the backoff sleep, and a 429 never re-enters the queue.
         """
+        self._skip_worker_retry = False
         try:
             url = f"{_API_BASE}/channels/{target}/messages"
             headers = {
@@ -403,6 +387,9 @@ class DiscordNotifier:
                             resp.status_code, resp.text[:500], target,
                             self._bot_name,
                         )
+                        # 429 is handled above. Any other 4xx is final.
+                        if resp.status_code < 500:
+                            self._skip_worker_retry = True
                         return False
                     return True
                 time.sleep(_retry_after_sleep_s(resp, delay))
