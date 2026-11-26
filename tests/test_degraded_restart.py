@@ -1585,7 +1585,12 @@ def test_shutdown_arms_dump_and_return_from_main_does_not_cancel(
         app._shutdown_link()
         assert order == ["leave", "dump", "disc"]
         assert dumps == [(30, False, True)] and "cancel" not in order
-        note_return_from_main()
+        saved_boot = rb._process_booted
+        rb._process_booted = True
+        try:
+            note_return_from_main()
+        finally:
+            rb._process_booted = saved_boot
         assert "cancel" not in order
         assert "return from main" in capsys.readouterr().out
         order.clear()

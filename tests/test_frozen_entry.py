@@ -70,14 +70,16 @@ def test_spawn_guard_runs_before_tk_import():
     assert "_init_com()" not in pre_tk
     bottom = text.split('if __name__ == "__main__":')[-1]
     assert bottom.index("dispatch_entry") < bottom.index("import run_bot_cli")
-    assert "sys.exit(run_bot_cli.main(routed))" in bottom
-    assert "note_return_from_main" not in bottom
+    assert bottom.index("run_bot_cli.main(routed)") < bottom.index(
+        "note_return_from_main()") < bottom.index("sys.exit(")
     main_body = text.split("def main():", 1)[1].split(
         'if __name__ == "__main__":', 1)[0]
+    assert "_mark_process_booted()" in main_body
     assert main_body.index("root.mainloop()") < main_body.index("note_return_from_main()")
     cli = (REPO / "run_bot_cli.py").read_text(encoding="utf-8")
     cli_tail = cli.split('if __name__ == "__main__":')[-1]
-    assert "note_return_from_main" not in cli_tail
+    assert 'if "run_backtest" in sys.modules:' in cli_tail
+    assert "sys.modules[\"run_backtest\"].note_return_from_main()" in cli_tail
     assert not any(
         line.strip().startswith("import run_backtest")
         for line in cli_tail.splitlines())

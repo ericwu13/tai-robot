@@ -13931,14 +13931,39 @@ def release_com_connections() -> None:
     _safe_log(f"[HEADLESS] COM disconnect ok={ok}")
 
 
+# Set when this process booted a bot, the GUI, or COM. list/status do not.
+_process_booted = False
+
+
+def _mark_process_booted() -> None:
+    """Record a boot on every loaded copy of this module.
+
+    ``python run_backtest.py`` is ``__main__`` and is imported again as
+    ``run_backtest`` once headless starts, so one assignment would miss
+    the copy that logs the return.
+    """
+    global _process_booted
+    _process_booted = True
+    for name in ("run_backtest", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "_process_booted"):
+            mod._process_booted = True
+
+
 def note_return_from_main() -> None:
-    """Log that main is returning. The hang dump stays armed."""
+    """Log that main is returning. Silent unless this process booted.
+
+    The hang dump is not touched here.
+    """
+    if not _process_booted:
+        return
     _safe_log("[HEADLESS] return from main")
 
 
 def main():
     # First: COM init and Tk both create (hidden) windows, and DPI
     # awareness can only be set before the process owns any window.
+    _mark_process_booted()
     enable_dpi_awareness()
     _init_com()
     register_com_events()
@@ -13962,9 +13987,11 @@ if __name__ == "__main__":
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
-        # list/status --json must stay valid JSON. The exit log is
-        # inside run_deploy / run_backtest, after a bot or COM boot.
-        sys.exit(run_bot_cli.main(routed))
+        _code = run_bot_cli.main(routed)
+        # No-op unless _boot or GUI main set the flag, so list/status
+        # --json stays valid JSON.
+        note_return_from_main()
+        sys.exit(_code)
     if kind != "gui":
         raise SystemExit(0)
     main()
