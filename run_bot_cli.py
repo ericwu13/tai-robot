@@ -203,4 +203,9 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     # freeze_support() already ran above, before headless imported Tk.
-    sys.exit(main())
+    # Do not import run_backtest here. list/status never loaded it, and
+    # a cold import would pull in tkinter on every subcommand.
+    _code = main()
+    if "run_backtest" in sys.modules:
+        sys.modules["run_backtest"].note_return_from_main()
+    sys.exit(_code)

@@ -662,6 +662,7 @@ class BacktestDriver(_Driver):
 # ── entry points used by run_bot_cli.py ──
 
 def _boot(policy: HeadlessPolicy, need_com: bool) -> tuple[HeadlessBotApp | None, int]:
+    rb._mark_process_booted()
     rb._init_com()
     if need_com and not rb._com_available:
         print("Capital API COM not available (SDK libs missing or not registered)",
@@ -694,8 +695,8 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     try:
         cfg = load() or {}
     except Exception as exc:
-        rb._log(f"[HEADLESS] discord settings unreadable: "
-                f"[{type(exc).__name__}] {exc}")
+        rb._safe_log(f"[HEADLESS] discord settings unreadable: "
+                     f"[{type(exc).__name__}] {exc}")
         return None
     if not isinstance(cfg, dict):
         return None
@@ -707,22 +708,36 @@ def _resolve_discord(bot: str = "", symbol: str = ""):
     return DiscordNotifier(token, channel, bot_name=bot, symbol=symbol)
 
 
-def _flush_discord(discord) -> None:
+# ce93800a flushed 5s after spawn. The child is already in wait_for_old_pid.
+_POST_SPAWN_FLUSH_S = 5.0
+
+
+def _log_discord_flush(discord, timeout_s: float) -> bool:
     if discord is None or not getattr(discord, "enabled", False):
-        return
+        return True
     flush = getattr(discord, "flush", None)
     if not callable(flush):
-        return
+        return True
+    ok = False
     try:
-        flush(timeout_s=5.0)
+        ok = bool(flush(timeout_s=timeout_s))
     except Exception as exc:
-        rb._log(f"[HEADLESS] discord flush failed: [{type(exc).__name__}] {exc}")
+        rb._safe_log(
+            f"[HEADLESS] discord flush failed: [{type(exc).__name__}] {exc}")
+    rb._safe_log(f"[HEADLESS] discord flush {ok}")
+    if not ok:
+        rb._safe_log("[HEADLESS] discord send may have been cut off")
+    return ok
+
+
+def _flush_discord(discord) -> None:
+    _log_discord_flush(discord, _POST_SPAWN_FLUSH_S)
 
 
 def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
                          symbol: str = "") -> None:
-    rb._log("[HEADLESS] degraded auto-restart failed: "
-            + reason + (f" — {detail}" if detail else ""))
+    rb._safe_log("[HEADLESS] degraded auto-restart failed: "
+                 + reason + (f" — {detail}" if detail else ""))
     discord = _resolve_discord(bot=bot, symbol=symbol)
     if discord is None or not getattr(discord, "enabled", False):
         return
@@ -735,12 +750,11 @@ def _emit_restart_failed(reason: str, *, detail: str = "", bot: str = "",
                 f"自動重啟失敗 Auto-restart failed: {reason} {detail}",
                 priority=True,
             )
-        flush = getattr(discord, "flush", None)
-        if callable(flush):
-            flush(timeout_s=5.0)
+        from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+        _log_discord_flush(discord, FLUSH_EXIT_TIMEOUT_S)
     except Exception as exc:
-        rb._log(f"[HEADLESS] restart-failed alert failed: "
-                f"[{type(exc).__name__}] {exc}")
+        rb._safe_log(f"[HEADLESS] restart-failed alert failed: "
+                     f"[{type(exc).__name__}] {exc}")
 
 
 def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
@@ -762,7 +776,6 @@ def _fail_pending_replacement(bot_dir: str, bot_name: str, reason: str,
 
 
 def _spawn_pending_restart(driver, code: int) -> int:
-    """Spawn the replacement only after ``_teardown`` has returned."""
     cmd = getattr(driver, "_pending_restart_cmd", None) if driver is not None else None
     if not cmd:
         return code
@@ -771,7 +784,7 @@ def _spawn_pending_restart(driver, code: int) -> int:
                    else os.path.join(os.getcwd(), "cli_stdout.log"))
     try:
         from src.paths import project_root
-        spawn_detached(cmd, stdout_path, cwd=project_root())
+        proc = spawn_detached(cmd, stdout_path, cwd=project_root())
     except OSError as exc:
         symbol = str(getattr(getattr(driver, "args", None), "symbol", "") or "")
         _emit_restart_failed(
@@ -784,6 +797,7 @@ def _spawn_pending_restart(driver, code: int) -> int:
             from src.live.degraded_restart import clear_pending_notify
             clear_pending_notify(bot_dir)
         return EXIT_BOT_STOPPED
+    rb._safe_log(f"[HEADLESS] spawned replacement pid={proc.pid}")
     _flush_discord(getattr(rb, "_discord", None))
     return code
 
@@ -799,6 +813,10 @@ def run_deploy(args) -> int:
     symbol = str(getattr(args, "symbol", "") or "")
     old_pid = int(getattr(args, "wait_for_pid", 0) or 0)
     if old_pid > 0:
+        # Before _boot, so a pid-wait warning is on stdout. Deploy's
+        # own attach runs only after the wait succeeds.
+        rb.attach_app_log_handlers()
+        rb._safe_log(f"[HEADLESS] pid-wait start old={old_pid}")
         if not wait_for_old_pid(old_pid, timeout_s=PID_WAIT_S):
             _emit_restart_failed(
                 "old process still alive",
@@ -886,3 +904,4 @@ def _teardown(app: HeadlessBotApp) -> None:
         app.root.destroy()
     except Exception:
         pass
+    rb._safe_log("[HEADLESS] root.destroy done")
