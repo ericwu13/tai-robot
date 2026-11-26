@@ -391,13 +391,13 @@ def _pr_merge(repo, number, *flags):
 
 
 def enable_auto_merge(repo, number, head_sha):
-    """Squash auto-merge pinned to ``head_sha``. One clean-status retry, no admin."""
+    """Squash auto-merge pinned to ``head_sha``. One direct-merge retry when already mergeable (clean/unstable), no admin."""
     proc = _pr_merge(repo, number, "--auto", "--squash", "--match-head-commit", head_sha)
     text = _merge_text(proc)
     if proc.returncode == 0 or "already merged" in text.lower():
         print(f"auto-merge enabled for {repo}#{number} at {head_sha}")
         return 0
-    if "clean status" in text.lower():
+    if any(s in text.lower() for s in ("clean status", "unstable status")):
         proc = _pr_merge(repo, number, "--squash", "--match-head-commit", head_sha)
         text = _merge_text(proc)
         if proc.returncode == 0 or "already merged" in text.lower():
