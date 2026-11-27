@@ -40,6 +40,12 @@ trading:
   # to auto past lots that running bots' own position logs account for.
   # Only a boolean true opts in.
   shared_book_opt_in: {}
+  # The real-order entry gate needs one lot's 原始保證金. Running bots
+  # download TAIFEX's margin table (one bot per host, every 3 h) into
+  # data/taifex_margin.json and post one Discord notice when it changes.
+  # false stops the download; the gate then uses that file's last copy or
+  # the built-in table, whichever TAIFEX dated later.
+  taifex_margin_sync: true
   # Default real-order daily loss limit (NT$) offered by the deploy
   # dialog and `run_bot_cli deploy --loss-limit`. The gate itself is
   # per bot; this value is only the pre-fill. During the night session

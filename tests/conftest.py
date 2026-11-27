@@ -15,13 +15,16 @@ if str(project_root) not in sys.path:
 def _isolate_ai_usage_log(tmp_path, tmp_path_factory, monkeypatch):
     """Redirect writers that would otherwise touch the repo ``data/`` tree.
 
-    The AI usage CSV and the host grid slot (``data/evo_grid.slot``)
-    both land in a per-test temp directory. Tests that pass their own
-    slot path still do, because that argument wins over the env var.
+    The AI usage CSV, the host grid slot (``data/evo_grid.slot``) and the
+    TAIFEX margin cache all land in a per-test temp directory. Tests that
+    pass their own slot path still do, because that argument wins over the
+    env var.
     """
     monkeypatch.setenv("TAI_AI_USAGE_LOG", str(tmp_path / "ai_usage.csv"))
     slot_dir = tmp_path_factory.mktemp("evo_grid_slot")
     monkeypatch.setenv("TAI_EVO_GRID_SLOT", str(slot_dir / "evo_grid.slot"))
+    # TAIFEX margin cache (src/live/margin_table.py) stays off data/ too.
+    monkeypatch.setenv("TAI_MARGIN_CACHE", str(tmp_path / "taifex_margin.json"))
     # Reset the one-time stderr notice so each test starts from a clean state.
     from src.ai import chat_client as _cc
     monkeypatch.setattr(_cc, "_usage_log_notified", False)
