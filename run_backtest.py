@@ -123,6 +123,7 @@ from src.live.live_runner import LiveRunner, LiveState, arm_headless_file_guard,
 from src.live.trading_guard import TradingGuard, apply_resume_guard
 from src.live.position_log import PositionLedger
 from src.live import shared_book as _shared_book
+from src.live import margin_table as _margin_table
 from src.utils import fileio as _fileio
 from src.live.tick_watchdog import TickWatchdog
 from src.live.main_heartbeat import call_com, set_com_return_logger
@@ -591,6 +592,10 @@ def _load_settings():
             # rule as the opt-in above: only boolean true counts.
             cfg["shared_book_opt_in"] = _mreq.parse_dashboard_auto_opt_in(
                 trading.get("shared_book_opt_in"))
+            # TAIFEX margin download for the entry gate. Only boolean
+            # false turns it off (src/live/margin_table.py).
+            cfg["taifex_margin_sync"] = (
+                trading.get("taifex_margin_sync", True) is not False)
             # Pre-fill for the deploy dialog / CLI. The real-order gate
             # is per deploy (persisted in session.json); this is only the
             # default offered. Distinct from risk.max_daily_loss, which
@@ -913,6 +918,16 @@ def _refuse_overlapping_evolution(app, *, auto_run: bool) -> None:
             _discord.notify_evolution(msg)
         except Exception:
             pass
+
+
+def _notify_margin_change(msg: str) -> None:
+    """Discord notice for a TAIFEX margin change (margin-sync thread).
+
+    Only the bot holding the host margin-sync lock sends it, once per change.
+    """
+    discord = _discord
+    if discord is not None and getattr(discord, "enabled", False):
+        discord.notify(msg, priority=True)
 
 
 def _evolution_history_sealed() -> None:
@@ -10577,9 +10592,30 @@ class BacktestApp:
         self._check_session_end_report()
         self._check_weekly_evolution()
         self._check_regime_poll()
+        self._check_margin_sync()
         self._live_poll_id = self.root.after(
             self._STATUS_POLL_INTERVAL_S * 1000,
             self._schedule_status_update)
+
+    def _check_margin_sync(self):
+        """Keep data/taifex_margin.json fresh (download runs off the Tk thread).
+
+        ``trading.taifex_margin_sync: false`` stops the download; the entry
+        gate then uses the last cache or the built-in table.
+        """
+        try:
+            settings = getattr(self, "_settings", None) or {}
+            if settings.get("taifex_margin_sync", True) is False:
+                return
+            sync = getattr(self, "_margin_sync", None)
+            if sync is None:
+                sync = _margin_table.MarginSync(
+                    _margin_table.default_cache_path(),
+                    notify=_notify_margin_change, log=_safe_log)
+                self._margin_sync = sync
+            sync.poll()
+        except Exception as e:
+            _log(f"[MARGIN] sync poll error: [{type(e).__name__}] {e}")
 
     def _check_regime_poll(self):
         """Run regime orchestration poll for RegimeSwitchingRunner bots."""
@@ -12078,10 +12114,15 @@ class BacktestApp:
                 available = float(self._account_monitor.rights.get("available", "0"))
                 symbol = self._live_runner.symbol if self._live_runner else ""
                 cfg = SYMBOL_CONFIG.get(symbol, {})
-                required = cfg.get("init_margin", 0)
+                # One lot's 原始保證金 from the newest of the synced TAIFEX
+                # table and the built-in one (src/live/margin_table.py).
+                required, margin_src = _margin_table.initial_margin(
+                    cfg.get("taifex_id", ""),
+                    path=_margin_table.default_cache_path(),
+                    fallback=cfg.get("init_margin", 0))
                 allowed, reason = TradingGuard.check_margin(available, required)
                 if not allowed:
-                    msg = f"保證金不足 {reason}"
+                    msg = f"保證金不足 {reason} ({margin_src})"
                     self._live_log_msg(msg, "exit")
                     self._log_order_decision("REAL_ORDER_BLOCKED", msg)
                     _log(f"REAL ORDER BLOCKED: {msg}")

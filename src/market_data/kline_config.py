@@ -55,18 +55,23 @@ LIVE_CHART_TIMEFRAMES = {
 # data/backfill/{prefix}/ folder). It is NOT the TradingView ticker, so
 # MTX00's prefix "TMF1" and TMF00's "IMF1" are kept as-is to keep existing
 # files and folders addressable.
+#
+# "init_margin" is one lot's 原始保證金 as TAIFEX published it on 2026/08/12.
+# The real-order entry gate reads src/live/margin_table.py, which syncs the
+# current table from TAIFEX; this value is only its fallback for a product
+# that table does not list. Keep it equal to margin_table.BUILTIN.
 
 SYMBOL_CONFIG = {
     "TX00": {"prefix": "TXF1", "tv": "TXF1!", "pv": 200, "tick_divisor": 100,
-             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 322000,
+             "taifex_id": "TX", "order_symbol": "TXFD0", "init_margin": 701000,
              "near_month": True},
     "MTX00": {"prefix": "TMF1", "tv": "MXF1!", "pv": 50, "tick_divisor": 100,
               "taifex_id": "MTX", "order_symbol": "MTXFD0",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 80500,
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 175250,
               "near_month": True},
     "TMF00": {"prefix": "IMF1", "tv": "TMF1!", "pv": 10, "tick_divisor": 100,
               "taifex_id": "TMF", "order_symbol": "TM0000",
-              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 16100,
+              "kline_symbol": "TX00", "tick_symbol": "TX00", "init_margin": 35050,
               "near_month": True},
 }
 
