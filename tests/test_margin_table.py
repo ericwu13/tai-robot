@@ -364,3 +364,18 @@ def test_notify_error_is_logged_not_raised(tmp_path):
         start_thread=lambda target: target())
     assert sync.poll() is True
     assert any("notify failed" in line for line in logs)
+
+
+def test_failed_attempt_backs_off_other_bots_on_the_host(tmp_path):
+    clock, notes, logs = _Clock(), [], []
+    first, calls1 = _sync(tmp_path, ["got an HTML page, not the CSV"],
+                          clock, notes, logs)
+    second, calls2 = _sync(tmp_path, [_table()], clock, notes, logs)
+    assert first.poll() is True and len(calls1) == 1
+    clock.t += 60
+    assert second.poll() is True            # its own first try …
+    assert calls2 == []                     # … sees the host stamp and waits
+    clock.t += mt.RETRY_S
+    assert second.poll() is True
+    assert len(calls2) == 1
+    assert mt.current_table(second.cache_path).published == "2026/12/01"

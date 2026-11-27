@@ -19,7 +19,8 @@ pattern, not by line, so it does not depend on the line breaks.
 Refresh: ``MarginSync.poll`` runs on the Tk thread with the 30 s status
 poll. When the cache is older than ``REFRESH_S`` it starts one daemon
 thread. That thread takes a non-blocking host-wide lock next to the
-cache (one refresh per host however many bots run), downloads, validates,
+cache (one refresh per host however many bots run; a host-wide attempt
+stamp spaces retries ``RETRY_S`` apart), downloads, validates,
 writes the cache atomically and, when the effective table changed, logs
 and sends one notice. The Tk thread only stats and reads the small cache.
 """
@@ -43,7 +44,7 @@ MARGIN_URL = "https://www.taifex.com.tw/cht/5/indexMargingDown"
 CACHE_NAME = "taifex_margin.json"
 CACHE_VERSION = 1
 REFRESH_S = 3 * 3600          # cache age that triggers a download
-RETRY_S = 15 * 60             # wait after a started attempt, in this process
+RETRY_S = 15 * 60             # wait after an attempt, per process and per host
 FETCH_TIMEOUT_S = 20
 MAX_DOWNLOAD_BYTES = 512_000
 CLOCK_SKEW_S = 300            # a cache stamped this far ahead still counts
@@ -420,6 +421,29 @@ class MarginSync:
         age = now - cached.fetched_at
         return -CLOCK_SKEW_S <= age < self.refresh_s
 
+    def _attempt_path(self) -> str:
+        return self.cache_path + ".attempt"
+
+    def _host_attempt_recent(self, now: float) -> bool:
+        """True when any bot on this host tried within ``retry_s``.
+
+        Keeps a refused download (say TAIFEX changed the file) to one try
+        per ``retry_s`` per host, not one per bot.
+        """
+        text = fileio.read_text(self._attempt_path())
+        try:
+            last = float((text or "").strip())
+        except ValueError:
+            return False
+        return -CLOCK_SKEW_S <= now - last < self.retry_s
+
+    def _stamp_host_attempt(self, now: float) -> None:
+        try:
+            with open(self._attempt_path(), "w", encoding="utf-8") as f:
+                f.write(repr(float(now)))
+        except OSError:
+            pass
+
     def poll(self) -> bool:
         """Start a background refresh when due. True when one was started."""
         now = self._clock()
@@ -456,8 +480,10 @@ class MarginSync:
             if not _lock_nb(fd):
                 return  # another bot on this host is refreshing
             try:
-                if self.cache_fresh(self._clock()):
+                now = self._clock()
+                if self.cache_fresh(now) or self._host_attempt_recent(now):
                     return
+                self._stamp_host_attempt(now)
                 before = current_table(self.cache_path)
                 table, reason = self._fetch()
                 if table is None:
