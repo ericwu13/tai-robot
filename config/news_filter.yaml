@@ -97,7 +97,7 @@ prefilter:
     - '\bBIS\b|商務部|出口管制|晶片管制|晶片禁令|禁令|制裁|export\s+(?:control|ban|curb|rule)|remote\s+AI\s+chip|chip\s+(?:export|curb|ban|access)|tariff|關稅'
     - 'moratorium|暫停令|ERCOT|TCEQ|電網許可|電網審查'
     - '限空令|禁空令|金管會|國安基金|熔斷|halts?\s+trade|trading\s+halt|違約交割'
-    - '黃仁勳.{0,12}(?:辭|下台|撤換|作證|傳票)|(?:resign|resignation|ousted|step\s+down|testify|CEO\s+(?:search|successor|replacement))'
+    - '黃仁勳.{0,12}(?:辭|下台|撤換|作證|傳票|回歸|回鍋|回任|復職|歸位|重返|重掌)|(?:resign|resignation|ousted|step\s+down|testify|reinstat|rehire|Huang\W{0,2}s?\s+(?:return|comeback)|return(?:s|ing)?\s+(?:as\s+CEO|to\s+Nvidia)|CEO\s+(?:search|successor|replacement|return))'
     # CREDIT_FLOWS
     - 'CoreWeave|\bCRWV\b|\bCDS\b|credit\s+spread|unsecured\s+bond|停買庫藏股|ATM\s+equity|增資|發債|greenshoe'
     - 'BofA|FMS|fund manager survey|SOXX|SMH|SOXL'

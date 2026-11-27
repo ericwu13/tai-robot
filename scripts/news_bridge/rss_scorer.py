@@ -1566,11 +1566,13 @@ def _run_v2_live(
     )
 
     mode = cfg.get("discord_mode", DEFAULT_DISCORD_MODE)
-    # v1's session EMA (±1.5, 2h) and v2's (+0.85/-0.85, 10h, 0.45 hysteresis)
-    # are different scales. Read the previous mode before this pass stamps
-    # it: only an already-live pass keeps session_net.
-    was_live = state.get("pipeline_v2_mode") == "live"
+    # v1's EMA and v2's, or two router policies, are different scales. Read the
+    # stored mode and policy before this pass stamps them: only a pass already
+    # live on this SignalRouter.POLICY_VERSION keeps session_net.
+    was_live = (state.get("pipeline_v2_mode") == "live"
+                and state.get("pipeline_v2_policy") == SignalRouter.POLICY_VERSION)
     state["pipeline_v2_mode"] = "live"
+    state["pipeline_v2_policy"] = SignalRouter.POLICY_VERSION
     state["last_fetched"] = len(all_articles)
     state["last_new"] = len(guid_new)
 
@@ -1581,6 +1583,7 @@ def _run_v2_live(
         state["session_net"] = 0.0
         state["session_peak"] = 0.0
         state["v2_active_vote"] = ""
+        withdraw_w3_vote(vote_out, session_key)  # quiet pass skips withdraw once both are empty
     active_vote = str(state.get("v2_active_vote") or "")
 
     if not guid_new:
