@@ -9,6 +9,7 @@ does not restart again. ``semi_auto`` alerts only.
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import subprocess
 import sys
@@ -96,6 +97,8 @@ class _Discord:
         self.recovered = []
         self.skipped = []
         self.failed = []
+        self.waiting = []
+        self.events = []
         self.notes = []
         self.stopped = []
 
@@ -110,6 +113,12 @@ class _Discord:
 
     def degraded_restart_failed(self, reason, **kwargs):
         self.failed.append((reason, kwargs))
+        self.events.append("failed")
+
+    def degraded_restart_still_waiting(self, *, old_pid, waited_s, bot=""):
+        self.waiting.append({
+            "old_pid": old_pid, "waited_s": waited_s, "bot": bot})
+        self.events.append("waiting")
 
     def notify(self, message, *, priority=False):
         self.notes.append((message, priority))
@@ -629,6 +638,189 @@ def test_alert_only_sends_one_discord_and_does_not_stop(tmp_path, monkeypatch):
     assert driver._pending_restart_cmd is None
 
 
+def _policy_lines(logs) -> list[str]:
+    return [line for line in logs if "degraded-restart policy:" in line]
+
+
+def test_policy_outcome_logged_once_per_change(tmp_path, monkeypatch):
+    """Noop/clock_started, Noop/waiting, and Defer/fill_pending each log once."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    app._trading_guard.fill_pending = False
+
+    driver._poll_once()
+    for _ in range(3):
+        driver._poll_once()
+    lines = _policy_lines(logs)
+    assert sum("Noop/clock_started" in line for line in lines) == 1
+    assert sum("Noop/waiting" in line for line in lines) == 1
+    assert all("mode=paper" in line for line in lines)
+
+    _arm(driver._restart_policy)
+    app._trading_guard.fill_pending = True
+    for _ in range(3):
+        driver._poll_once()
+    lines = _policy_lines(logs)
+    assert sum("Defer/fill_pending" in line for line in lines) == 1
+    assert sum("Noop/clock_started" in line for line in lines) == 1
+    assert sum("Noop/waiting" in line for line in lines) == 1
+
+
+def test_not_degraded_is_silent_and_rearms(tmp_path, monkeypatch):
+    """not_degraded logs nothing and lets the next episode log clock_started."""
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    flag = {"degraded": False}
+    app._link_host = SimpleNamespace(
+        snapshot=lambda: {"degraded": flag["degraded"]})
+
+    driver._poll_once()
+    driver._poll_once()
+    assert _policy_lines(logs) == []
+
+    flag["degraded"] = True
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+
+    flag["degraded"] = False
+    driver._poll_once()
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+    assert all("not_degraded" not in line for line in _policy_lines(logs))
+
+    flag["degraded"] = True
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 2
+
+
+def test_fresh_tick_and_clock_started_share_one_log_line(tmp_path, monkeypatch):
+    """Reply-only DEGRADED alternates fresh_tick and clock_started.
+
+    Those two Noops are one steady state: one line, the first reason.
+    waiting still logs. not_degraded stays silent and re-arms.
+    """
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    policy = driver._restart_policy
+    # Clock already open, and each poll's tick is newer than it, so
+    # observe_app alternates fresh_tick then clock_started.
+    policy.degraded_open_since = NOW - 1
+
+    n = 6
+    for _ in range(n):
+        app._last_fresh_tick_at = float(policy._now()) + 1.0
+        driver._poll_once()
+    fresh = "[HEADLESS] degraded-restart policy: Noop/fresh_tick mode=paper"
+    waiting = "[HEADLESS] degraded-restart policy: Noop/waiting mode=paper"
+    started = "[HEADLESS] degraded-restart policy: Noop/clock_started mode=paper"
+    assert _policy_lines(logs) == [fresh]
+
+    app._last_fresh_tick_at = 0.0
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting]
+
+    app._link_host = SimpleNamespace(snapshot=lambda: {"degraded": False})
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting]
+
+    app._link_host = SimpleNamespace(snapshot=lambda: {"degraded": True})
+    driver._poll_once()
+    assert _policy_lines(logs) == [fresh, waiting, started]
+
+
+def test_restart_decision_adds_no_extra_policy_line(tmp_path, monkeypatch):
+    """RestartDecision keeps the existing restart line and adds no policy line.
+
+    The clock_started line has to be present first: on master a restart
+    poll already logged only that existing line, so this test would pass
+    there without the new policy logger.
+    """
+    logs: list[str] = []
+    monkeypatch.setattr(rb, "_log", logs.append)
+    runner = _runner(tmp_path, "paper")
+    app, _discord = _app(monkeypatch, runner, "paper")
+    driver = _poll_driver(tmp_path, app, monkeypatch, mode="paper")
+    driver._restart_policy.degraded_open_since = None
+    app._trading_guard.fill_pending = False
+    driver._poll_once()
+    assert sum("Noop/clock_started" in line for line in _policy_lines(logs)) == 1
+
+    _arm(driver._restart_policy)
+    marked = len(logs)
+    driver._poll_once()
+    fresh = logs[marked:]
+    assert any("degraded auto-restart session=" in line for line in fresh)
+    assert not any("degraded-restart policy:" in line for line in fresh)
+
+
+def test_snapshot_exception_logged_once_by_type(caplog):
+    """A snapshot failure logs the exception type once, never the message."""
+    dr._snapshot_error = None
+    secret = "do-not-log-this-snapshot-message"
+    calls = {"n": 0}
+
+    def snap():
+        calls["n"] += 1
+        n = calls["n"]
+        if n <= 3:
+            raise RuntimeError(secret)
+        if n == 4:
+            raise ValueError(secret)
+        if n == 5:
+            return {"degraded": True}
+        raise RuntimeError(secret)
+
+    app = _app_view()
+    app._link_host.snapshot = snap
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.live.degraded_restart"):
+            assert dr._snapshot_degraded(app) is False
+            assert dr._snapshot_degraded(app) is False
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 1
+            assert "RuntimeError" in logged[0].getMessage()
+            assert secret not in logged[0].getMessage()
+            assert logged[0].exc_info is None
+
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 2
+            assert "ValueError" in logged[1].getMessage()
+            assert secret not in logged[1].getMessage()
+
+            assert dr._snapshot_degraded(app) is True
+            assert dr._snapshot_degraded(app) is False
+            logged = _snapshot_records(caplog)
+            assert len(logged) == 3
+            assert "RuntimeError" in logged[2].getMessage()
+
+            outcome = _Clock().policy().observe_app(app, bot_dir="unused")
+            assert outcome == dr.Noop("not_degraded")
+            assert len(_snapshot_records(caplog)) == 3
+    finally:
+        dr._snapshot_error = None
+
+
+def _snapshot_records(caplog):
+    return [
+        rec for rec in caplog.records
+        if rec.name == "src.live.degraded_restart"
+        and rec.levelno == logging.WARNING
+    ]
+
+
 # ── run_deploy lifecycle ─────────────────────────────────────────────
 
 
@@ -756,6 +948,11 @@ def test_run_deploy_aborts_before_login_when_old_pid_stays_alive(
     monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
     monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close",
+        lambda *_a, **_k: dr.MIN_MINUTES_LEFT_FOR_RESTART,
+    )
+    assert dr.minutes_until_session_close("TMF00") == dr.MIN_MINUTES_LEFT_FOR_RESTART
     monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: booted.append("boot"))
     code = run_deploy(args)
     assert code not in (0, None)
@@ -937,6 +1134,7 @@ def test_discord_methods_priority_and_wording():
         bot="night1", session_key=SESSION, mode="semi_auto", reason="semi_auto",
     )
     note.degraded_restart_failed("spawn failed", detail="OSError", bot="night1")
+    note.degraded_restart_still_waiting(old_pid=55, waited_s=60, bot="night1")
     assert sent[0][1] is True
     assert SESSION in sent[0][0] and "auto" in sent[0][0]
     assert "77" in sent[0][0] and "SHORT x1" in sent[0][0]
@@ -946,6 +1144,10 @@ def test_discord_methods_priority_and_wording():
     assert "semi_auto" in sent[2][0] and SESSION in sent[2][0]
     assert sent[3][1] is True
     assert "spawn failed" in sent[3][0] and "OSError" in sent[3][0]
+    assert sent[4][1] is True
+    assert "Still waiting" in sent[4][0]
+    assert "仍在等待" in sent[4][0]
+    assert "55" in sent[4][0] and "60" in sent[4][0]
 
 
 def _plant_pending(bot_dir: str) -> None:
@@ -1074,23 +1276,211 @@ def test_normal_deploy_does_not_emit_a_replacement_failure(tmp_path, monkeypatch
     assert _pending(bot_dir)["pending_notify"] is True
 
 
-def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mins", [dr.MIN_MINUTES_LEFT_FOR_RESTART, None])
+def test_old_pid_wait_gives_up_when_the_session_budget_is_gone(
+        tmp_path, monkeypatch, capsys, mins):
+    """After the 60s miss, a closed or near-close session still stops."""
     import src.live.headless_app as ha
 
     _patch_project(monkeypatch, tmp_path)
     discord = _Discord()
     monkeypatch.setattr(rb, "_discord", discord)
-    monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
-    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
-    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+    clock = {"t": 0.0}
 
+    def _mono():
+        return clock["t"]
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] > 180:
+            raise RuntimeError("pid wait did not stop")
+
+    monkeypatch.setattr(time, "monotonic", _mono)
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close", lambda *_a, **_k: mins)
+    assert dr.minutes_until_session_close("TMF00") == mins
+    booted = []
+    monkeypatch.setattr(
+        ha, "_boot", lambda *_a, **_k: booted.append("boot") or (None, EXIT_LOGIN))
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=91)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    assert clock["t"] >= dr.PID_WAIT_S
+    assert code == headless.EXIT_TIMEOUT
+    assert booted == []
+    assert discord.events == ["waiting", "failed"]
+    assert discord.waiting[0]["old_pid"] == 91
+    assert int(discord.waiting[0]["waited_s"]) == int(dr.PID_WAIT_S)
+    assert discord.failed[0][0] == "old process still alive"
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is False
+    assert saved["session_key"] == SESSION
+    assert saved["old_pid"] == 77
+    out = capsys.readouterr().out
+    assert "pid-wait budget gone" in out
+    assert "symbol=TMF00" in out
+    assert f"mins_left={mins}" in out
+    assert "exited at" not in out
+
+
+def test_settlement_morning_uses_the_order_symbol_and_does_not_boot(
+        tmp_path, monkeypatch):
+    """Quote symbol still has budget; the front-month order symbol does not.
+
+    2026-11-18 13:26 TPE is that month's settlement morning. ``TMF00``
+    closes at 13:45 (19 min left, still above the gate). ``TM0000``
+    closes at 13:30 (4 min), which the parent gate already refuses.
+    The child must not boot.
+    """
+    import src.live.headless_app as ha
+    import src.live.live_runner as live_runner
+    from src.market_data.kline_config import resolve_order_symbol
+
+    fixed = datetime(2026, 11, 18, 13, 26, tzinfo=TPE)
+    monkeypatch.setattr(live_runner, "_taipei_now", lambda: fixed)
+    assert resolve_order_symbol("TMF00") == "TM0000"
+    assert live_runner.minutes_until_session_close("TMF00") == 19
+    assert live_runner.minutes_until_session_close("TM0000") == 4
+    assert 19 > dr.MIN_MINUTES_LEFT_FOR_RESTART
+    assert 4 <= dr.MIN_MINUTES_LEFT_FOR_RESTART
+
+    _patch_project(monkeypatch, tmp_path)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    clock = {"t": 0.0}
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] > 180:
+            raise RuntimeError("pid wait did not stop")
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(
+        LiveRunner, "_pid_alive",
+        staticmethod(lambda _pid: clock["t"] <= dr.PID_WAIT_S))
+    booted = []
+    monkeypatch.setattr(
+        ha, "_boot", lambda *_a, **_k: booted.append("boot") or (None, EXIT_LOGIN))
+    args, bot_dir = _deploy_args(tmp_path, wait_for_pid=91)
+    _plant_pending(bot_dir)
+    code = run_deploy(args)
+    assert booted == []
+    assert code == headless.EXIT_TIMEOUT
+    detail = discord.failed[0][1]["detail"]
+    assert "order=TM0000" in detail
+    assert f"after {int(clock['t'])}s" in detail
+    assert _pending(bot_dir)["pending_notify"] is False
+    assert _pending(bot_dir)["session_key"] == SESSION
+
+
+def test_stalling_still_waiting_flush_does_not_delay_boot(
+        tmp_path, monkeypatch):
+    """The old pid dies 0.25s after the 60s miss. A flush must not hold boot."""
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    clock = {"t": 0.0}
+    sent = []
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+
+    class _Note:
+        enabled = True
+
+        def degraded_restart_still_waiting(self, **kwargs):
+            sent.append(kwargs)
+
+        def flush(self, timeout_s=5.0):
+            clock["t"] += 2.0
+            return False
+
+    monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(
+        LiveRunner, "_pid_alive",
+        staticmethod(lambda _pid: clock["t"] <= dr.PID_WAIT_S))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close",
+        lambda *_a, **_k: dr.MIN_MINUTES_LEFT_FOR_RESTART + 10)
+    monkeypatch.setattr(rb, "_discord", _Note())
+    booted = {}
+
+    def _boot(*_a, **_k):
+        booted["t"] = clock["t"]
+        return None, EXIT_LOGIN
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    args, _bot = _deploy_args(tmp_path, wait_for_pid=77)
+    run_deploy(args)
+    assert sent
+    assert booted["t"] < dr.PID_WAIT_S + 1
+
+
+def test_early_handoff_failures_clear_pending_notify(tmp_path, monkeypatch, capsys):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    discord = _Discord()
+    monkeypatch.setattr(rb, "_discord", discord)
+    monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
+
+    # The old pid outlives the 60s wait, then exits while the session
+    # budget is still open. ``<= PID_WAIT_S`` keeps the timeout check
+    # itself seeing a live pid; the next poll sees it gone.
+    clock = {"t": 0.0}
+
+    def _mono():
+        return clock["t"]
+
+    def _sleep(seconds):
+        clock["t"] += float(seconds)
+        if clock["t"] > 180:
+            raise RuntimeError("pid wait did not stop")
+
+    def _alive(_pid):
+        return clock["t"] <= dr.PID_WAIT_S
+
+    monkeypatch.setattr(time, "monotonic", _mono)
+    monkeypatch.setattr(time, "sleep", _sleep)
+    monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(_alive))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close",
+        lambda *_a, **_k: dr.MIN_MINUTES_LEFT_FOR_RESTART + 10,
+    )
+    assert dr.minutes_until_session_close("TMF00") == (
+        dr.MIN_MINUTES_LEFT_FOR_RESTART + 10)
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+    booted = []
+
+    def _boot(*_a, **_k):
+        booted.append("boot")
+        return app, EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_drive_until_exit", lambda *_a, **_k: EXIT_OK)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
     args, bot_dir = _deploy_args(tmp_path, wait_for_pid=55)
     _plant_pending(bot_dir)
     code = run_deploy(args)
-    assert code != EXIT_OK
-    assert discord.failed[0][0] == "old process still alive"
-    assert _pending(bot_dir)["pending_notify"] is False
-    assert _pending(bot_dir)["session_key"] == SESSION
+    assert code == EXIT_OK
+    assert code != headless.EXIT_TIMEOUT
+    assert booted == ["boot"]
+    assert discord.failed == []
+    assert discord.events == ["waiting"]
+    assert discord.waiting[0]["old_pid"] == 55
+    assert int(discord.waiting[0]["waited_s"]) == int(dr.PID_WAIT_S)
+    saved = _pending(bot_dir)
+    assert saved["pending_notify"] is True
+    assert saved["session_key"] == SESSION
+    assert saved["old_pid"] == 77
+    out = capsys.readouterr().out
+    assert "old pid 55 exited at" in out
+    assert "TPE" in out
+    assert clock["t"] > dr.PID_WAIT_S
 
     discord.failed.clear()
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
@@ -1193,18 +1583,29 @@ def test_missing_discord_still_delivers_before_run_deploy_returns(
 
 
 def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
-        tmp_path, monkeypatch):
+        tmp_path, monkeypatch, capsys):
     import src.live.headless_app as ha
     from src.live.discord_notify import DiscordNotifier
 
     _patch_project(monkeypatch, tmp_path)
     sent = []
+    timeouts = []
+    orig_flush = DiscordNotifier.flush
+
+    def _flush(self, timeout_s=5.0):
+        timeouts.append(timeout_s)
+        return orig_flush(self, timeout_s)
+
     monkeypatch.setattr(rb, "_discord", None)
     monkeypatch.setattr(rb, "_load_settings", _settings_with_discord)
     monkeypatch.setattr(DiscordNotifier, "_deliver", _slow_deliver(sent))
+    monkeypatch.setattr(DiscordNotifier, "flush", _flush)
     monkeypatch.setattr(dr, "PID_WAIT_S", 0.0)
     monkeypatch.setattr(dr, "DEFAULT_RELOGIN_WAIT_S", 0.0)
     monkeypatch.setattr(LiveRunner, "_pid_alive", staticmethod(lambda _pid: True))
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close", lambda *_a, **_k: None)
+    assert dr.minutes_until_session_close("TMF00") is None
 
     args, bot_dir = _deploy_args(tmp_path, wait_for_pid=82)
     _plant_pending(bot_dir)
@@ -1212,8 +1613,16 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     finished = time.monotonic()
     assert code != EXIT_OK
     assert sent and sent[-1][0] <= finished
-    assert "old process still alive" in sent[-1][1]
+    texts = [text for _ts, text in sent]
+    assert any("Still waiting" in text and "82" in text for text in texts)
+    assert any("old process still alive" in text for text in texts)
     assert _pending(bot_dir)["pending_notify"] is False
+    assert "discord flush True" in capsys.readouterr().out
+    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+    # Still-waiting is queued on the one pre-boot notifier and is not
+    # flushed on its own. The give-up flush is that same notifier, so
+    # it waits for the still-waiting send as well.
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S]
 
     sent.clear()
     args, bot_dir = _deploy_args(tmp_path, relogin_stagger=True, wait_for_pid=0)
@@ -1229,6 +1638,8 @@ def test_pid_and_slot_timeouts_deliver_with_no_installed_notifier(
     assert "relogin stagger timed out" in sent[-1][1]
     assert _pending(bot_dir)["pending_notify"] is False
     assert _pending(bot_dir)["session_key"] == SESSION
+    assert "discord flush True" in capsys.readouterr().out
+    assert timeouts == [FLUSH_EXIT_TIMEOUT_S, FLUSH_EXIT_TIMEOUT_S]
 
 
 def test_empty_discord_settings_log_and_still_clear_pending(tmp_path, monkeypatch, capsys):
@@ -1283,6 +1694,162 @@ def test_flush_waits_for_a_priority_send_and_times_out_when_it_blocks():
     assert time.monotonic() - started < 1.0
 
 
+def _discord_settings(**extra):
+    cfg = {
+        "discord_bot_token": "t",
+        "discord_channel_id": "1",
+        "discord_evolution_channel_id": "2",
+        "discord_daily_report_channel_id": "3",
+        "discord_regime_channel_id": "4",
+    }
+    cfg.update(extra)
+    return cfg
+
+
+def _notify_threads():
+    return [t for t in threading.enumerate()
+            if t.name == "discord-notify" and t.is_alive()]
+
+
+def test_pre_boot_still_waiting_and_give_up_share_one_notifier(monkeypatch):
+    """One notifier, and the give-up flush waits out the slower send.
+
+    Still-waiting stays inside the transport until the give-up flush is
+    waiting on that same worker. The give-up transport returns at once.
+    A flush that does not wait returns while still-waiting is in flight.
+    """
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+
+    made = []
+    finished = []
+    real_init = DiscordNotifier.__init__
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _init(self, *args, **kwargs):
+        made.append(self)
+        real_init(self, *args, **kwargs)
+
+    def _deliver(self, content, target):
+        if "Still waiting" in content:
+            entered.set()
+            release.wait(timeout=2)
+            finished.append(("wait", self))
+        elif "Auto-restart failed" in content:
+            finished.append(("fail", self))
+        return True
+
+    def _unlock():
+        if not entered.wait(timeout=2) or not made:
+            return
+        note = made[0]
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if getattr(note._idle_ready, "_waiters", None):
+                release.set()
+                return
+            time.sleep(0.001)
+
+    monkeypatch.setattr(DiscordNotifier, "__init__", _init)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _deliver)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", _discord_settings)
+    unlocker = threading.Thread(target=_unlock, name="release-still-waiting",
+                                daemon=True)
+    unlocker.start()
+    try:
+        ha._emit_restart_still_waiting(
+            9, 60.0, bot="night1", symbol="TMF00", order_symbol="TM0000")
+        assert entered.wait(timeout=2)
+        ha._emit_restart_failed(
+            "old process still alive", detail="pid 9", bot="night1",
+            symbol="TMF00")
+        kinds = [kind for kind, _note in finished]
+        assert len(made) == 1
+        assert kinds[:2] == ["wait", "fail"]
+        assert all(note is made[0] for _kind, note in finished)
+        assert rb._discord is made[0]
+        assert made[0]._evolution_channel_id == "2"
+        assert made[0]._daily_report_channel_id == "3"
+        assert made[0]._regime_channel_id == "4"
+    finally:
+        release.set()
+        unlocker.join(timeout=2)
+
+
+def test_happy_path_deploy_keeps_the_pre_boot_notifier(tmp_path, monkeypatch):
+    """Old pid exits after still-waiting. Deploy keeps that notifier.
+
+    No second ``DiscordNotifier`` and no second ``discord-notify`` worker.
+    Deploy only writes the bot name, symbol, and channel ids.
+    """
+    import src.live.headless_app as ha
+    from src.live.discord_notify import DiscordNotifier
+    from tests.test_heartbeat_wiring import _Strategy, _app, _cleanup, _install_runner
+
+    made = []
+    real_init = DiscordNotifier.__init__
+
+    def _init(self, *args, **kwargs):
+        made.append(self)
+        real_init(self, *args, **kwargs)
+
+    def _deliver(self, content, target):
+        return True
+
+    monkeypatch.setattr(DiscordNotifier, "__init__", _init)
+    monkeypatch.setattr(DiscordNotifier, "_deliver", _deliver)
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", _discord_settings)
+    monkeypatch.setattr(dr, "wait_for_old_pid", lambda *_a, **_k: False)
+    monkeypatch.setattr(
+        dr, "poll_old_pid_until_exit_or_budget",
+        lambda *_a, **_k: ("exited", None))
+    _patch_project(monkeypatch, tmp_path)
+    bot_dir = str(tmp_path / "bot")
+    _install_runner(monkeypatch, bot_dir)
+    app = _app(bot_dir)
+    app._settings = _discord_settings(
+        discord_channel_id="9",
+        discord_evolution_channel_id="evo",
+        discord_daily_report_channel_id="day",
+        discord_regime_channel_id="reg",
+    )
+    app._start_live_warmup = lambda: None
+    before = {t.ident for t in _notify_threads()}
+
+    def _boot(*_a, **_k):
+        return app, EXIT_OK
+
+    def _drive(_driver, app_):
+        assert app_._deploy_live_continue(
+            None, _Strategy, False, None, False, False, False,
+            None, "paper", "night1") is True
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", _boot)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a, **_k: None)
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    try:
+        args, _live = _deploy_args(tmp_path, wait_for_pid=77)
+        code = run_deploy(args)
+        assert code == EXIT_OK
+        assert len(made) == 1
+        pre = made[0]
+        assert rb._discord is pre
+        assert pre._bot_name == "night1"
+        assert pre._symbol == "TMF00"
+        assert pre._evolution_channel_id == "evo"
+        assert pre._daily_report_channel_id == "day"
+        assert pre._regime_channel_id == "reg"
+        spawned = [t for t in _notify_threads() if t.ident not in before]
+        assert spawned == [pre._worker]
+        assert pre._worker is not None and pre._worker.is_alive()
+    finally:
+        _cleanup()
+
+
 def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path):
     marker = tmp_path / "delivered"
     repo = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -1310,4 +1877,370 @@ def test_emit_restart_failed_finishes_the_send_before_the_process_exits(tmp_path
     )
     assert proc.returncode == 0, proc.stderr
     assert marker.is_file(), proc.stderr
+    assert "discord flush True" in proc.stdout, proc.stdout
+    assert "may have been cut off" not in proc.stdout
 
+
+def _com_globals():
+    return (
+        list(rb._com_event_handlers),
+        (rb.skC, rb.skQ, rb.skR, rb.skO),
+        rb._com_released, rb._exit_dump_skip_logged,
+        rb._comtypes_atexit_wrapped, rb._faulthandler_log,
+    )
+
+
+def _restore_com_globals(saved) -> None:
+    handlers, sk, released, skip, wrapped, handle = saved
+    rb._com_event_handlers[:] = handlers
+    rb.skC, rb.skQ, rb.skR, rb.skO = sk
+    rb._com_released = released
+    rb._exit_dump_skip_logged = skip
+    rb._comtypes_atexit_wrapped = wrapped
+    rb._faulthandler_log = handle
+
+
+class _FlushNote:
+    enabled = True
+
+    def __init__(self):
+        self.timeouts = []
+
+    def degraded_restart_failed(self, reason, **kwargs):
+        self.reason = reason
+
+    def flush(self, timeout_s=5.0):
+        self.timeouts.append(timeout_s)
+        return False
+
+
+def test_flush_false_is_logged_and_restart_failed_uses_the_long_cap(
+        monkeypatch, capsys):
+    import src.live.headless_app as ha
+    from src.live.discord_notify import FLUSH_EXIT_TIMEOUT_S
+
+    note = _FlushNote()
+    monkeypatch.setattr(rb, "_discord", note)
+    ha._emit_restart_failed(
+        "old process still alive", detail="pid 1", bot="night1", symbol="TMF00")
+    out = capsys.readouterr().out
+    assert "discord flush False" in out and "may have been cut off" in out
+    assert note.timeouts == [FLUSH_EXIT_TIMEOUT_S]
+
+
+def test_spawn_runs_before_the_only_flush_and_that_flush_is_five_seconds(
+        tmp_path, monkeypatch):
+    """A stalling flush must not run until the replacement has been spawned."""
+    import threading
+
+    import src.live.headless_app as ha
+
+    order = []
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _spawn(*_a, **_k):
+        order.append("spawn")
+        return SimpleNamespace(pid=4242)
+
+    def _flush(timeout_s=5.0):
+        order.append(("enter", timeout_s))
+        entered.set()
+        release.wait(2)
+        order.append(("flush", timeout_s))
+        return True
+
+    note = _FlushNote()
+    note.flush = _flush
+    monkeypatch.setattr(rb, "_discord", note)
+    monkeypatch.setattr(ha, "spawn_detached", _spawn)
+    driver = SimpleNamespace(
+        _pending_restart_cmd=["tai", "deploy"], bot_dir=str(tmp_path),
+        args=SimpleNamespace(symbol="TMF00"))
+    box = {}
+
+    def _run():
+        try:
+            box["code"] = ha._spawn_pending_restart(driver, 0)
+        except Exception as exc:
+            box["err"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    try:
+        assert entered.wait(2)
+        assert order == ["spawn", ("enter", 5.0)]
+    finally:
+        release.set()
+        thread.join(3)
+    assert not thread.is_alive()
+    assert box.get("err") is None and box.get("code") == 0
+    assert [item for item in order if item[0] == "flush"] == [("flush", 5.0)]
+
+
+def test_discord_warning_reaches_stdout_before_pid_wait(
+        tmp_path, monkeypatch, capsys):
+    import logging
+    import src.live.headless_app as ha
+
+    log = logging.getLogger("src.live.discord_notify")
+    saved = (log.level, list(log.handlers))
+    seen = {}
+
+    def _wait(pid, timeout_s=None):
+        seen["before"] = capsys.readouterr().out
+        log.warning("discord-before-boot")
+        return False
+
+    _patch_project(monkeypatch, tmp_path)
+    monkeypatch.setattr(dr, "wait_for_old_pid", _wait)
+    monkeypatch.setattr(
+        dr, "minutes_until_session_close", lambda *_a, **_k: None)
+    assert dr.minutes_until_session_close("TMF00") is None
+    monkeypatch.setattr(rb, "_discord", None)
+    monkeypatch.setattr(rb, "_load_settings", lambda: {})
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (_ for _ in ()).throw(
+        AssertionError("boot")))
+    try:
+        code = run_deploy(_deploy_args(tmp_path, wait_for_pid=5151)[0])
+    finally:
+        log.setLevel(saved[0])
+        log.handlers[:] = saved[1]
+    assert code != EXIT_OK
+    assert "pid-wait start old=5151" in seen["before"]
+    assert "[src.live.discord_notify] discord-before-boot" in capsys.readouterr().out
+
+
+def test_spawn_logs_the_replacement_pid_and_oserror_does_not(
+        tmp_path, monkeypatch, capsys):
+    import src.live.headless_app as ha
+
+    _patch_project(monkeypatch, tmp_path)
+    monkeypatch.setattr(rb, "_discord", None)
+    args, bot_dir = _deploy_args(tmp_path)
+    app = SimpleNamespace(root=SimpleNamespace(), _release_relogin_slot=None)
+
+    def _drive(driver, _app):
+        driver.bot_dir = bot_dir
+        driver._pending_restart_cmd = ["tai", "deploy", "--resume"]
+        return EXIT_OK
+
+    monkeypatch.setattr(ha, "_boot", lambda *_a, **_k: (app, EXIT_OK))
+    monkeypatch.setattr(ha, "_drive_until_exit", _drive)
+    monkeypatch.setattr(ha, "_teardown", lambda *_a: None)
+    monkeypatch.setattr(
+        ha, "spawn_detached", lambda *_a, **_k: SimpleNamespace(pid=4242))
+    assert run_deploy(args) == EXIT_OK
+    assert "spawned replacement pid=4242" in capsys.readouterr().out
+    monkeypatch.setattr(rb, "_discord", _Discord())
+    monkeypatch.setattr(
+        ha, "spawn_detached",
+        lambda *_a, **_k: (_ for _ in ()).throw(OSError("spawn failed")))
+    assert run_deploy(args) == EXIT_BOT_STOPPED
+    assert "spawned replacement pid=" not in capsys.readouterr().out
+
+
+def test_root_destroy_is_logged_on_headless_and_gui_close(capsys):
+    import src.live.headless_app as ha
+
+    def _boom():
+        raise RuntimeError("destroy failed")
+
+    ha._teardown(SimpleNamespace(
+        root=SimpleNamespace(destroy=_boom), _shutdown_link=lambda: None))
+    assert "root.destroy done" in capsys.readouterr().out
+    gui = rb.BacktestApp.__new__(rb.BacktestApp)
+    gui._auto_save_chat = lambda: None
+    gui._shutdown_link = lambda: None
+    gui.root = SimpleNamespace(destroy=_boom)
+    gui._on_closing()
+    assert "root.destroy done" in capsys.readouterr().out
+
+
+def test_release_com_is_idempotent_and_shutdown_without_a_host_releases(capsys):
+    from run_backtest import release_com_connections
+
+    saved = _com_globals()
+    calls = []
+
+    class _Ok:
+        def disconnect(self):
+            calls.append("ok")
+
+    class _Bad:
+        def disconnect(self):
+            calls.append("bad")
+            raise RuntimeError("unadvise failed")
+
+    try:
+        rb._com_released = False
+        rb._faulthandler_log = None
+        rb._com_event_handlers[:] = [_Ok(), _Bad(), object()]
+        rb.skC = rb.skQ = rb.skR = rb.skO = "live"
+        release_com_connections()
+        out = capsys.readouterr().out
+        assert calls == ["ok", "bad"]
+        assert rb._com_event_handlers == []
+        assert rb.skC is rb.skQ is rb.skR is rb.skO is None
+        assert "COM disconnect ok=1" in out
+        release_com_connections()
+        assert calls == ["ok", "bad"]
+        assert "COM disconnect ok=" not in capsys.readouterr().out
+        text = open(os.path.join(os.path.dirname(__file__), "..", "run_backtest.py"),
+                    encoding="utf-8").read()
+        body = text[text.index("    def _stop_live("):text.index("\n# Event sinks")]
+        assert "release_com_connections" not in body
+        assert "_shutdown_link(" not in body
+
+        calls.clear()
+        rb._com_released = False
+        rb._com_event_handlers[:] = [_Ok()]
+        rb.skC = "live"
+        app = rb.BacktestApp.__new__(rb.BacktestApp)
+        app._link_host = None
+        app._cancel_reply_poll = lambda: None
+        app._shutdown_link()
+        assert calls == ["ok"] and rb.skC is None
+        assert "COM disconnect ok=1" in capsys.readouterr().out
+    finally:
+        _restore_com_globals(saved)
+
+
+def test_shutdown_arms_dump_and_return_from_main_does_not_cancel(
+        tmp_path, monkeypatch, capsys):
+    import faulthandler
+    from run_backtest import note_return_from_main
+
+    saved = _com_globals()
+    handle = open(tmp_path / "faulthandler.log", "a", encoding="utf-8")
+    order, dumps = [], []
+
+    def _dump(timeout, exit=False, file=None):
+        dumps.append((timeout, exit, file is handle))
+        order.append("dump")
+
+    monkeypatch.setattr(faulthandler, "dump_traceback_later", _dump)
+    monkeypatch.setattr(faulthandler, "cancel_dump_traceback_later",
+                        lambda: order.append("cancel"))
+
+    class _Host:
+        def shutdown(self, now):
+            order.append("leave")
+
+    class _Conn:
+        def disconnect(self):
+            order.append("disc")
+
+    app = rb.BacktestApp.__new__(rb.BacktestApp)
+    app._cancel_reply_poll = lambda: None
+    try:
+        rb._faulthandler_log = handle
+        rb._exit_dump_skip_logged = False
+        rb._com_released = False
+        rb._com_event_handlers[:] = [_Conn()]
+        app._link_host = _Host()
+        app._shutdown_link()
+        assert order == ["leave", "dump", "disc"]
+        assert dumps == [(30, False, True)] and "cancel" not in order
+        saved_boot = rb._process_booted
+        rb._process_booted = True
+        try:
+            note_return_from_main()
+        finally:
+            rb._process_booted = saved_boot
+        assert "cancel" not in order
+        assert "return from main" in capsys.readouterr().out
+        order.clear()
+        dumps.clear()
+        rb._faulthandler_log = None
+        rb._exit_dump_skip_logged = False
+        rb._com_released = True
+        app._link_host = _Host()
+        app._shutdown_link()
+        assert dumps == [] and "leave" in order
+        closed = open(tmp_path / "closed.log", "a", encoding="utf-8")
+        closed.close()
+        rb._faulthandler_log = closed
+        app._shutdown_link()
+        assert dumps == []
+    finally:
+        _restore_com_globals(saved)
+        handle.close()
+
+
+def test_atexit_brackets_comtypes_shutdown(monkeypatch, capsys, tmp_path):
+    import atexit
+    import faulthandler
+    import logging
+    import sys
+    import types
+    from run_backtest import arm_process_exit_diagnostics
+
+    saved = _com_globals()
+    rb._faulthandler_log = None
+    rb._comtypes_atexit_wrapped = False
+    monkeypatch.delitem(sys.modules, "comtypes", raising=False)
+    kept = []
+    try:
+        arm_process_exit_diagnostics()
+        assert "comtypes not loaded" in capsys.readouterr().out
+        called = []
+
+        def original():
+            called.append(1)
+            if len(called) > 1:
+                raise RuntimeError("co")
+
+        mod = types.ModuleType("comtypes")
+        mod._shutdown = original
+        monkeypatch.setitem(sys.modules, "comtypes", mod)
+        atexit.register(original)
+        seen = []
+        real_reg, real_unreg = atexit.register, atexit.unregister
+        monkeypatch.setattr(
+            atexit, "register",
+            lambda fn, *a, **k: seen.append(fn) or real_reg(fn, *a, **k))
+        monkeypatch.setattr(
+            atexit, "unregister",
+            lambda fn, *a, **k: seen.append(("u", fn)) or real_unreg(fn, *a, **k))
+        rb._comtypes_atexit_wrapped = False
+        arm_process_exit_diagnostics()
+        assert ("u", original) in seen
+        wrappers = [fn for fn in seen if not isinstance(fn, tuple)]
+        assert wrappers and wrappers[0] is not original
+        kept.extend(wrappers)
+        logging.getLogger("comtypes._post_coinit.unknwn").debug(
+            "Calling CoUninitialize()")
+        assert "Calling CoUninitialize()" in capsys.readouterr().out
+        handle = open(tmp_path / "fh.log", "a", encoding="utf-8")
+        rb._faulthandler_log = handle
+        rb._exit_dump_skip_logged = False
+        dumps = []
+        monkeypatch.setattr(
+            faulthandler, "dump_traceback_later",
+            lambda timeout, exit=False, file=None: dumps.append(
+                (timeout, exit, file is handle)))
+        wrappers[-1]()
+        out = capsys.readouterr().out
+        assert dumps == [(30, False, True)]
+        assert "atexit begin" in out and "atexit end" in out and called == [1]
+        handle.close()
+        rb._exit_dump_skip_logged = False
+        dumps.clear()
+        with pytest.raises(RuntimeError, match="co"):
+            wrappers[-1]()
+        out = capsys.readouterr().out
+        assert dumps == [] and "no open handle" in out and "atexit end" in out
+        seen.clear()
+        arm_process_exit_diagnostics()
+        assert seen == []
+    finally:
+        _restore_com_globals(saved)
+        if "handle" in locals() and not handle.closed:
+            handle.close()
+        atexit.unregister(locals().get("original", lambda: None))
+        for fn in kept:
+            atexit.unregister(fn)
+        log = logging.getLogger("comtypes")
+        log.handlers[:] = [h for h in log.handlers
+                           if h.__class__.__name__ != "_AppLogHandler"]

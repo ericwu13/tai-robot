@@ -27,6 +27,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from src.live.account_monitor import note_open_interest_query
+
 
 class ReconnectForbidden(RuntimeError):
     """logout / process restart are not reconnect operations."""
@@ -187,6 +189,10 @@ class ComBrokerPort:
             start_date, end_date, minute_num)
 
     def get_open_interest(self, user_id: str, account: str, fmt: int = 1):
+        # Stamp before the broker call so a raised query still occupies the
+        # 5s slot. Fill-poll, mode-request, reconcile, and the account poll
+        # all come through here, so they cannot skip the clock.
+        note_open_interest_query()
         _skc, _skq, _skr, sko = self._libs()
         return self._direct(
             "GetOpenInterestGW", sko.GetOpenInterestGW,

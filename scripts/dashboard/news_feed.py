@@ -59,6 +59,16 @@ def _str(value, limit: int = 400) -> str:
     return value[:limit] if isinstance(value, str) else ""
 
 
+def _finite_opt(value) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(v, 4) if math.isfinite(v) else None
+
+
 def normalize(raw) -> dict | None:
     """One stored line → the row the page renders, or None if unusable.
 
@@ -75,7 +85,7 @@ def normalize(raw) -> dict | None:
     direction = _str(raw.get("direction"), 16).lower()
     if direction not in _DIRECTIONS:
         direction = "neutral"
-    return {
+    row = {
         "published_at": published or scored,
         "scored_at": scored,
         "session": _str(raw.get("session"), 32),
@@ -92,6 +102,12 @@ def normalize(raw) -> dict | None:
         # Lines written before run_scale existed were plain sums.
         "run_scale": round(_num(raw.get("run_scale"), 1.0), 4),
     }
+    v2 = raw.get("v2")
+    if isinstance(v2, dict):
+        ws = _finite_opt(v2.get("weighted_score"))
+        if ws is not None:
+            row["weighted_score"] = ws
+    return row
 
 
 def parse_query(query: dict) -> dict:

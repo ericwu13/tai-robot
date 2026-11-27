@@ -452,6 +452,57 @@ class TestNasdaqCurlFetch:
         saved = json.loads(out.read_text(encoding="utf-8"))
         assert any(e.get("category") == "earnings_avgo" for e in saved["events"])
 
+    def test_partial_403_retains_cached_events_for_failed_tickers_only(self, monkeypatch):
+        prev_cache = {
+            "nasdaq_earnings": [
+                {
+                    "date": "2026-12-03",
+                    "name": "AVGO earnings (US after-close, est)",
+                    "severity": "high",
+                    "sessions": ["DAY"],
+                    "source": "nasdaq_earnings",
+                    "category": "earnings_avgo",
+                },
+                {
+                    "date": "2026-12-18",
+                    "name": "MU earnings (US after-close)",
+                    "severity": "medium",
+                    "sessions": ["DAY"],
+                    "source": "nasdaq_earnings",
+                    "category": "earnings_mu",
+                },
+            ]
+        }
+        _mock_curl(monkeypatch, {
+            "AVGO": _CurlResp(200, json.dumps(_SAMPLE_NASDAQ_CONFIRMED)),
+            "MU": _CurlResp(403, "Access Denied"),
+        })
+        _block_urllib(monkeypatch)
+        res = build_calendar_events(
+            _nasdaq_only("AVGO", "MU"),
+            now=_FIXED_NOW,
+            prev_cached_by_source=prev_cache,
+        )
+        assert res.status == "degraded"
+        by_cat = {e["category"]: e["date"] for e in res.events}
+        # AVGO updated to fresh confirmed date (2026-12-10), MU retained from cache
+        assert by_cat == {"earnings_avgo": "2026-12-10", "earnings_mu": "2026-12-18"}
+        cached_cats = {e["category"] for e in res.cached_by_source["nasdaq_earnings"]}
+        assert cached_cats == {"earnings_avgo", "earnings_mu"}
+
+        # A subsequent full outage still recovers both tickers from the preserved cache
+        _mock_curl(monkeypatch, {
+            "AVGO": _CurlResp(403, "Access Denied"),
+            "MU": _CurlResp(403, "Access Denied"),
+        })
+        res2 = build_calendar_events(
+            _nasdaq_only("AVGO", "MU"),
+            now=_FIXED_NOW + timedelta(days=1),
+            prev_cached_by_source=res.cached_by_source,
+        )
+        assert res2.status == "failed"
+        assert {e["category"] for e in res2.events} == {"earnings_avgo", "earnings_mu"}
+
     def test_missing_curl_cffi_fails_nasdaq_only(self, monkeypatch):
         from src.news import calendar_fetchers as cf
 

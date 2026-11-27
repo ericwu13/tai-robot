@@ -13,6 +13,7 @@ Usage:
 
 from version import APP_VERSION
 
+import atexit
 import csv
 import faulthandler
 import logging
@@ -129,7 +130,8 @@ from src.live.tick_classifier import classify_tick, HISTORY_STALENESS_SECONDS
 from src.live.account_monitor import (
     AccountMonitor, parse_open_interest, parse_future_rights,
     resume_real_position_ok, close_order_side, FUTURES_OI_MARKET,
-    open_interest_query_rejected,
+    OI_QUERY_MIN_INTERVAL_S, open_interest_query_rejected,
+    sleep_open_interest_interval, wait_open_interest_spacing,
 )
 from src.live.connection_monitor import ConnectionMonitor
 from src.live.broker_port import DEFAULT_BROKER_MODE, require_inprocess
@@ -193,9 +195,10 @@ except ImportError:
 
 
 # How long the pre-deploy position check waits for the asynchronous
-# OnOpenInterest callback before giving up. The callback has been observed
-# ~4s after GetOpenInterestGW; the old fixed 0.5s sleep raced it.
-OI_SNAPSHOT_TIMEOUT_S = 5.0
+# OnOpenInterest callback before giving up. Replies have been observed
+# ~10s after GetOpenInterestGW; 15s is that plus 50% margin. The old
+# fixed 0.5s sleep raced it.
+OI_SNAPSHOT_TIMEOUT_S = 15.0
 
 # Real/auto entries stay held until the first valid GetFutureRights
 # reply has gone through TradingGuard.update_pnl. If that reply has
@@ -1205,6 +1208,13 @@ def _log(msg):
     _route_to_log_widget(line, "info")
 
 
+def _safe_log(msg: str) -> None:
+    try:
+        _log(msg)
+    except Exception:
+        pass
+
+
 class _AppLogHandler(logging.Handler):
     """Routes Python logging records into the app's _log() function."""
     def emit(self, record):
@@ -1212,6 +1222,35 @@ class _AppLogHandler(logging.Handler):
             _log(self.format(record))
         except Exception:
             pass
+
+
+_APP_LOG_NAMES = (
+    "src.live.discord_notify",
+    "src.live.live_runner",
+    "src.live.regime_switching_runner",
+    "src.live.tick_watchdog",
+    "src.market_data.holidays",
+    "src.live.quote_stuck_recovery",
+    "src.live.host_stall",
+    "src.live.main_heartbeat",
+    "src.live.loss_baseline",
+    "src.live.position_log",
+    "src.live.degraded_restart",
+    "src.live.leftover_sweep",
+)
+
+
+def attach_app_log_handlers(names=_APP_LOG_NAMES) -> None:
+    """Route these logs through ``_log``. Idempotent."""
+    for logger_name in names:
+        mod_logger = logging.getLogger(logger_name)
+        if any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
+            mod_logger.setLevel(logging.DEBUG)
+            continue
+        handler = _AppLogHandler()
+        handler.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
+        mod_logger.addHandler(handler)
+        mod_logger.setLevel(logging.DEBUG)
 
 
 def _log_debug(msg):
@@ -1245,18 +1284,28 @@ def _log_debug(msg):
     _route_to_log_widget(line, "debug")
 
 
+_COM_CODE_NAMES = ("EnterMonitorLONG", "LoginSetQuote", "LeaveMonitor")
+_last_is_connected = None
+
+
 def _log_com_return(name: str, elapsed_ms: float, failed: bool, code=None) -> None:
-    """P0 duration, plus the EnterMonitorLONG code on the #178 path.
+    """P0 duration. Selected SKCOM codes are a suffix on that one line.
 
     Logging only. The caller already invoked the COM method; this does
     not make another one and does not branch on the elapsed time or the
-    code. ``code`` is omitted when the call raised, and for every name
-    other than EnterMonitorLONG.
+    code. ``code`` is omitted when the call raised. Names in
+    ``_COM_CODE_NAMES`` always include it. IsConnected includes it only
+    when the value changes. Every other name stays duration-only.
     """
+    global _last_is_connected
     status = "raised" if failed else "returned"
     detail = ""
-    if name == "EnterMonitorLONG" and code is not None and not failed:
-        detail = f" code={code}"
+    if code is not None and not failed:
+        if name in _COM_CODE_NAMES:
+            detail = f" code={code}"
+        elif name == "IsConnected" and code != _last_is_connected:
+            _last_is_connected = code
+            detail = f" code={code}"
     _log_debug(
         f"[COM] {name} {status} in {elapsed_ms:.0f} ms{detail} "
         f"tid={threading.get_ident()}")
@@ -1674,6 +1723,9 @@ class BacktestApp:
         _app = self
 
         self.root = root
+        # Last bot this process deployed. _stop_live does not clear it:
+        # _shutdown_link writes .exiting here after the runner is gone.
+        self._exit_marker_dir = None
         # HeadlessBotApp sets ``policy`` before delegating here. Headless
         # bots get no theme at all: widget construction stays identical to
         # the unthemed app and the live path does zero extra work.
@@ -3019,16 +3071,34 @@ class BacktestApp:
                 pass
 
     def _shutdown_link(self) -> None:
-        """User shutdown. The only LeaveMonitor the live host asks for."""
+        """User shutdown. The only LeaveMonitor the live host asks for.
+
+        Then arm the exit dump and release COM. ``_stop_live`` does not
+        call this: a GUI Stop Bot keeps the process and its COM alive.
+        The exit marker names ``_exit_marker_dir`` (the last deploy).
+        Unset means this process never deployed, so nothing is written.
+        """
+        try:
+            from src.live.leftover_sweep import write_exiting_marker
+            write_exiting_marker(getattr(self, "_exit_marker_dir", None))
+        except Exception:
+            pass
         self._cancel_reply_poll()
         host = getattr(self, "_link_host", None)
-        if host is None:
-            return
+        if host is not None:
+            try:
+                host.shutdown(_taipei_now())
+            except Exception as e:
+                _safe_log(
+                    f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
+            self._link_host = None
+        # LeaveMonitor (or the skip) has returned. Arm while the
+        # apartment is still alive, then Unadvise, then drop the refs.
         try:
-            host.shutdown(_taipei_now())
+            arm_process_exit_diagnostics()
+            release_com_connections()
         except Exception as e:
-            _log(f"[RECONNECT] shutdown raised: [{type(e).__name__}] {e}")
-        self._link_host = None
+            _safe_log(f"[HEADLESS] COM release failed: [{type(e).__name__}] {e}")
 
     def _on_reconnected(self):
         """Resubscribe after the machine has seen quote READY (3003).
@@ -4610,7 +4680,11 @@ class BacktestApp:
         """Handle window close: auto-save chat, drop the quote link, destroy."""
         self._auto_save_chat()
         self._shutdown_link()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+        _safe_log("[HEADLESS] root.destroy done")
 
     # ══════════════════════════════════════════════════════════════
     #  SELF-UPDATE
@@ -9789,12 +9863,31 @@ class BacktestApp:
         if trading_mode in ("semi_auto", "auto") and self._futures_account:
             try:
                 user_id = self.login_user_var.get().strip()
+                # Capital wants >= 5s between GetOpenInterestGW calls. The
+                # OnComplete reconcile in this process often lands well
+                # inside that gap. Only this pre-deploy call waits; rights,
+                # mode-request, and the account poll are not spaced here.
+                wait_open_interest_spacing()
                 # New generation. clear_positions() must not be what drops
                 # the previous answer; only this query can complete it.
                 self._account_monitor.begin_oi_query()
                 code = _broker.get_open_interest(
                     user_id, self._futures_account, 1)
                 _log(f"部署前持倉查詢 Pre-deploy GetOpenInterestGW: code={code}")
+                if open_interest_query_rejected(code):
+                    _log(
+                        "持倉查詢被拒 Pre-deploy GetOpenInterestGW rejected: "
+                        f"code={code} — retry once after "
+                        f"{OI_QUERY_MIN_INTERVAL_S:.0f}s"
+                    )
+                    sleep_open_interest_interval()
+                    self._account_monitor.begin_oi_query()
+                    code = _broker.get_open_interest(
+                        user_id, self._futures_account, 1)
+                    _log(
+                        "部署前持倉查詢 Pre-deploy GetOpenInterestGW retry: "
+                        f"code={code}"
+                    )
                 if open_interest_query_rejected(code):
                     self._predeploy_oi_failed = True
                     self._predeploy_oi_unknown_reason = (
@@ -9806,7 +9899,7 @@ class BacktestApp:
                     )
                 elif self._oi_wait_must_block():
                     # The OnOpenInterest reply arrives asynchronously through
-                    # the UI queue — observed ~4s after the query. Headless
+                    # the UI queue — observed ~10s after the query. Headless
                     # drains the queue here (no update_idletasks).
                     self._wait_oi_snapshot_blocking()
                 else:
@@ -9885,6 +9978,8 @@ class BacktestApp:
             )
             self._regime_manager = None
         self._live_runner.acquire_lock()
+        # Last bot this process deployed. _stop_live does not clear it.
+        self._exit_marker_dir = self._live_runner.bot_dir
         self._position_ledger = PositionLedger(
             self._live_runner.bot_dir,
             bot_id=os.path.basename(os.path.normpath(self._live_runner.bot_dir)),
@@ -9955,18 +10050,10 @@ class BacktestApp:
                 regime_logger.setLevel(logging.DEBUG)
 
         # Route Discord and LiveRunner logging into the app's _log()
-        for logger_name in ("src.live.discord_notify", "src.live.live_runner",
-                            "src.live.regime_switching_runner",
-                            "src.live.tick_watchdog",
-                            "src.market_data.holidays"):
-            mod_logger = logging.getLogger(logger_name)
-            if not any(isinstance(h, _AppLogHandler) for h in mod_logger.handlers):
-                h = _AppLogHandler()
-                h.setFormatter(logging.Formatter("[%(name)s] %(message)s"))
-                mod_logger.addHandler(h)
-                mod_logger.setLevel(logging.DEBUG)
+        attach_app_log_handlers()
 
-        # Initialize Discord notifications
+        # Initialize Discord notifications. A pre-boot alert may already
+        # have installed the worker; replacing it would leak that client.
         global _discord
         from src.live.discord_notify import DiscordNotifier
         bot_token = self._settings.get("discord_bot_token", "")
@@ -9977,11 +10064,22 @@ class BacktestApp:
             "discord_daily_report_channel_id", "")
         regime_channel_id = self._settings.get(
             "discord_regime_channel_id", "")
-        _discord = DiscordNotifier(bot_token, channel_id,
-                                   bot_name=bot_name, symbol=symbol,
-                                   evolution_channel_id=evolution_channel_id,
-                                   daily_report_channel_id=daily_report_channel_id,
-                                   regime_channel_id=regime_channel_id)
+        if isinstance(_discord, DiscordNotifier):
+            _discord._bot_name = bot_name
+            _discord._symbol = symbol
+            _discord._evolution_channel_id = (
+                evolution_channel_id.strip() if evolution_channel_id else "")
+            _discord._daily_report_channel_id = (
+                daily_report_channel_id.strip() if daily_report_channel_id else "")
+            _discord._regime_channel_id = (
+                regime_channel_id.strip() if regime_channel_id else "")
+        else:
+            _discord = DiscordNotifier(
+                bot_token, channel_id,
+                bot_name=bot_name, symbol=symbol,
+                evolution_channel_id=evolution_channel_id,
+                daily_report_channel_id=daily_report_channel_id,
+                regime_channel_id=regime_channel_id)
         _deploy_mode_zh = {"paper": "模擬", "semi_auto": "半自動",
                            "auto": "全自動"}.get(trading_mode, trading_mode)
         if _discord.enabled:
@@ -13772,6 +13870,9 @@ class BacktestApp:
 # Event sinks + comtypes connections must outlive the event loop; keep them
 # referenced at module level (shared by the GUI main() and the headless CLI).
 _com_event_handlers: list = []
+_com_released = False
+_exit_dump_skip_logged = False
+_comtypes_atexit_wrapped = False
 
 
 def _bind_event_sink(kind: str, com_obj, handler, get_events):
@@ -13798,9 +13899,133 @@ def register_com_events() -> None:
         _bind_event_sink, comtypes.client.GetEvents)
 
 
+def _comtypes_shutdown_fn():
+    mod = sys.modules.get("comtypes")
+    fn = getattr(mod, "_shutdown", None) if mod is not None else None
+    if callable(fn):
+        return fn
+    try:
+        from comtypes._post_coinit.unknwn import _shutdown as fn
+    except Exception:
+        return None
+    return fn if callable(fn) else None
+
+
+def _attach_comtypes_log_handler() -> None:
+    log = logging.getLogger("comtypes")
+    if not any(isinstance(h, _AppLogHandler) for h in log.handlers):
+        handler = _AppLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        log.addHandler(handler)
+    log.setLevel(logging.DEBUG)
+
+
+def _arm_exit_traceback_dump() -> None:
+    global _exit_dump_skip_logged
+    handle = _faulthandler_log
+    if handle is None or getattr(handle, "closed", True):
+        if not _exit_dump_skip_logged:
+            _exit_dump_skip_logged = True
+            _safe_log("[HEADLESS] faulthandler exit dump skipped: no open handle")
+        return
+    try:
+        faulthandler.dump_traceback_later(30, exit=False, file=handle)
+    except Exception as exc:
+        _safe_log(
+            f"[HEADLESS] faulthandler exit dump not armed: "
+            f"[{type(exc).__name__}] {exc}")
+
+
+def _arm_comtypes_atexit() -> None:
+    global _comtypes_atexit_wrapped
+    if _comtypes_atexit_wrapped:
+        return
+    _comtypes_atexit_wrapped = True
+    if "comtypes" not in sys.modules:
+        _safe_log("[HEADLESS] comtypes not loaded; "
+                  "skip atexit CoUninitialize wrap")
+        return
+    try:
+        _attach_comtypes_log_handler()
+    except Exception:
+        pass
+    original = _comtypes_shutdown_fn()
+    if not callable(original):
+        _safe_log("[HEADLESS] comtypes _shutdown missing; skip atexit wrap")
+        return
+    try:
+        atexit.unregister(original)
+        def _wrapped() -> None:
+            _safe_log("atexit begin")
+            _arm_exit_traceback_dump()
+            try:
+                original()
+            finally:
+                _safe_log("atexit end")
+        atexit.register(_wrapped)
+    except Exception as exc:
+        _safe_log(
+            f"[HEADLESS] atexit wrap failed: [{type(exc).__name__}] {exc}")
+
+
+def arm_process_exit_diagnostics() -> None:
+    _arm_exit_traceback_dump()
+    _arm_comtypes_atexit()
+
+
+def release_com_connections() -> None:
+    global _com_released, skC, skQ, skR, skO
+    if _com_released:
+        return
+    _com_released = True
+    ok = 0
+    for obj in list(_com_event_handlers):
+        disconnect = getattr(obj, "disconnect", None)
+        if not callable(disconnect):
+            continue
+        try:
+            disconnect()
+            ok += 1
+        except Exception:
+            pass
+    _com_event_handlers.clear()
+    skC = skQ = skR = skO = None
+    _safe_log(f"[HEADLESS] COM disconnect ok={ok}")
+
+
+# Set when this process booted a bot, the GUI, or COM. list/status do not.
+_process_booted = False
+
+
+def _mark_process_booted() -> None:
+    """Record a boot on every loaded copy of this module.
+
+    ``python run_backtest.py`` is ``__main__`` and is imported again as
+    ``run_backtest`` once headless starts, so one assignment would miss
+    the copy that logs the return.
+    """
+    global _process_booted
+    _process_booted = True
+    for name in ("run_backtest", "__main__"):
+        mod = sys.modules.get(name)
+        if mod is not None and hasattr(mod, "_process_booted"):
+            mod._process_booted = True
+
+
+def note_return_from_main() -> None:
+    """Log that main is returning. Silent unless this process booted.
+
+    The hang dump is not touched here.
+    """
+    if not _process_booted:
+        return
+    _safe_log("[HEADLESS] return from main")
+
+
 def main():
     # First: COM init and Tk both create (hidden) windows, and DPI
     # awareness can only be set before the process owns any window.
+    _mark_process_booted()
     enable_dpi_awareness()
     _init_com()
     register_com_events()
@@ -13808,6 +14033,7 @@ def main():
     root = tk.Tk()
     app = BacktestApp(root)
     root.mainloop()
+    note_return_from_main()
 
 
 if __name__ == "__main__":
@@ -13823,7 +14049,11 @@ if __name__ == "__main__":
         # call enable_dpi_awareness / _init_com here. HeadlessBotApp owns
         # that init (once) via run_bot_cli → headless_app._boot.
         import run_bot_cli
-        sys.exit(run_bot_cli.main(routed))
+        _code = run_bot_cli.main(routed)
+        # No-op unless _boot or GUI main set the flag, so list/status
+        # --json stays valid JSON.
+        note_return_from_main()
+        sys.exit(_code)
     if kind != "gui":
         raise SystemExit(0)
     main()

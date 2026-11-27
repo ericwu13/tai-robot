@@ -14,6 +14,7 @@ an OS file lock under the deploy root so a crash cannot leave a holder.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import time
@@ -28,6 +29,9 @@ from .session_store import load_session, save_session
 from .tick_watchdog import TickWatchdog
 
 _TZ_TAIPEI = timezone(timedelta(hours=8))
+
+logger = logging.getLogger(__name__)
+_snapshot_error: str | None = None
 
 AUTO_RESTART_FILENAME = "auto_restart.json"
 RELOGIN_SLOT_NAME = ".relogin.slot"
@@ -204,15 +208,62 @@ def wait_for_old_pid(pid: int, *, timeout_s: float = PID_WAIT_S,
         pause(min(poll, max(0.0, deadline - now)))
 
 
+def poll_old_pid_until_exit_or_budget(
+    pid: int,
+    symbol: str | None,
+    *,
+    poll_s: float = 0.25,
+    sleep=None,
+    alive=None,
+    minutes_left=None,
+) -> tuple[str, int | None]:
+    """After ``wait_for_old_pid`` timed out. ``("exited", None)`` or ``("budget", mins)``.
+
+    Same ``poll_s`` default as :func:`wait_for_old_pid`. Give up when
+    ``minutes_until_session_close`` is ``None`` or at or under
+    ``MIN_MINUTES_LEFT_FOR_RESTART`` — the gate ``observe_app`` already
+    uses, not a new timeout. ``symbol`` is that gate's order symbol
+    (``resolve_order_symbol`` of the deploy arg). This does not call
+    ``save_auto_restart`` and does not touch ``session_key`` or
+    ``pending_notify``.
+
+    Budget is checked before liveness. A closed or near-close session
+    does not fall through to login even if the pid died on the same poll.
+    """
+    check = LiveRunner._pid_alive if alive is None else alive
+    pause = time.sleep if sleep is None else sleep
+    mins_fn = minutes_until_session_close if minutes_left is None else minutes_left
+    poll = 0.05 if poll_s is None or float(poll_s) <= 0 else float(poll_s)
+    while True:
+        try:
+            mins = mins_fn(symbol)
+        except TypeError:
+            mins = mins_fn()
+        if mins is None or mins <= MIN_MINUTES_LEFT_FOR_RESTART:
+            return "budget", mins
+        if not check(int(pid)):
+            return "exited", None
+        pause(poll)
+
+
 def _snapshot_degraded(app) -> bool:
+    global _snapshot_error
     host = getattr(app, "_link_host", None)
     snap = getattr(host, "snapshot", None)
     if not callable(snap):
         return False
     try:
         data = snap()
-    except Exception:
+    except Exception as exc:
+        name = type(exc).__name__
+        if name != _snapshot_error:
+            _snapshot_error = name
+            logger.warning(
+                "degraded-restart: link snapshot raised %s; treating as not degraded",
+                name,
+            )
         return False
+    _snapshot_error = None
     if not isinstance(data, dict):
         return False
     return bool(data.get("degraded"))

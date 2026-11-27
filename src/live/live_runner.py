@@ -666,12 +666,29 @@ class LiveRunner:
     # ── Lock file ──
 
     def acquire_lock(self) -> None:
-        """Write PID to lock file."""
+        """Write PID to the lock file.
+
+        Drop ``.exiting`` when it names this process. Another pid's
+        marker stays for the watchdog.
+        """
+        try:
+            from src.live.leftover_sweep import EXITING_FILENAME
+            from src.utils.fileio import read_json
+            path = os.path.join(self.bot_dir, EXITING_FILENAME)
+            data = read_json(path)
+            if isinstance(data, dict) and int(data.get("pid", 0)) == os.getpid():
+                os.remove(path)
+        except (OSError, TypeError, ValueError):
+            pass
         with open(self._lock_path, "w") as f:
             f.write(str(os.getpid()))
 
     def release_lock(self) -> None:
-        """Remove lock file."""
+        """Remove the lock file. Do not write or delete ``.exiting``.
+
+        ``_shutdown_link`` writes the marker. The watchdog deletes it,
+        and ``acquire_lock`` deletes it only for this process's own pid.
+        """
         try:
             os.remove(self._lock_path)
         except OSError:
@@ -2438,6 +2455,11 @@ class LiveRunner:
 
             report_key = f"{session_date}_{session_type}"
             if report_key == self._last_report_key:
+                if getattr(self, "_report_skip_logged", None) != (report_key, "sent"):
+                    self._report_skip_logged = (report_key, "sent")
+                    logger.info(
+                        "daily report skipped: key %s already sent (bot=%s)",
+                        report_key, self.bot_name)
                 return
 
             report = generate_session_report(
@@ -2454,6 +2476,11 @@ class LiveRunner:
                 session_close_dt=close_dt_str,
             )
             if report is None:
+                if getattr(self, "_report_skip_logged", None) != (report_key, "no_trades"):
+                    self._report_skip_logged = (report_key, "no_trades")
+                    logger.info(
+                        "daily report not generated: no completed trades for key %s (bot=%s)",
+                        report_key, self.bot_name)
                 return
             self._last_report_key = report_key
             self._auto_save_session()

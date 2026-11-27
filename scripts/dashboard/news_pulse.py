@@ -61,7 +61,12 @@ def build_drivers(items: list[dict], session: str, decay: float,
     out = []
     for r in rows:
         weight = decay ** later.get(r["scored_at"], 0)
-        base = clip(r["score"]) * r.get("run_scale", 1.0) if clip_scores else float(r["score"])
+        if clip_scores:
+            base = clip(r["score"]) * r.get("run_scale", 1.0)
+        elif r.get("weighted_score") is not None:
+            base = float(r["weighted_score"])
+        else:
+            base = float(r["score"])
         out.append({"title": r["title"], "link": r["link"], "source": r["source"],
                     "scored_at": r["scored_at"], "score": r["score"],
                     "reason": r["reason"], "weight": round(weight, 3),
